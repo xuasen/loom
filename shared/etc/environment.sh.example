@@ -12,6 +12,8 @@ P_MEMORY_ARN=arn:aws:bedrock-agentcore:$(REGION):$(ACCOUNTID):memory/$(P_AGENT_N
 P_BEDROCK_MODEL_ARNS="arn:aws:bedrock:*:$(ACCOUNTID):inference-profile/*,arn:aws:bedrock:*::foundation-model/*"
 P_AGENTCORE_REGIONS=*
 P_LOGS_REGION=$(REGION)
+# "true" adds Code Interpreter sandbox permissions to the role stack
+P_ENABLE_CODE_INTERPRETER=false
 
 # Derived configuration
 P_AGENT_NAME_SANITIZED=$(subst _,-,$(P_AGENT_NAME))
