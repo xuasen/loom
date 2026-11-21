@@ -88,9 +88,7 @@ Resources:
         HTTPSPort: 443
         OriginProtocolPolicy: https-only
         OriginSSLProtocols:
-          Items:
-            - TLSv1.2
-          Quantity: 1
+          - TLSv1.2
       Tags:
         - Key: loom:application
           Value: !Ref pTagApplication
