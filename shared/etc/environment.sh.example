@@ -26,7 +26,9 @@ P_COGNITO_POOL_NAME=$(COGNITO_POOL_NAME)
 P_COGNITO_DOMAIN=$(COGNITO_DOMAIN)
 P_COGNITO_RESOURCE_SERVER=loom
 P_COGNITO_SCOPES=invoke
-P_COGNITO_CALLBACK_URLS=https://localhost
+# Callbacks must point at the public CloudFront FQDN (set PUBLIC_FQDN in common.sh),
+# not the ALB. Comma-separate extra URLs if the app needs an explicit redirect path.
+P_COGNITO_CALLBACK_URLS=https://$(PUBLIC_FQDN)
 
 # Cognito stack configuration
 P_COGNITO_STACK=loom-cognito
@@ -59,7 +61,18 @@ P_INFRA_OUTPUT=iac/infra_output.yaml
 # Infrastructure parameters
 P_INFRA_VPC_ID=$(VPC_ID)
 P_INFRA_PUBLIC_SUBNET_IDS=$(PUBLIC_SUBNET_IDS)
+P_INFRA_PRIVATE_SUBNET_IDS=$(PRIVATE_SUBNET_IDS)
 P_INFRA_DOMAIN_NAME=$(PUBLIC_FQDN)
+# CloudFront VPC origin service SG id. Leave empty on the first infra deploy;
+# after `make cdn.deploy` creates the VPC origin, look up the auto-created
+# CloudFront-VPCOrigins-Service-SG and set it here, then re-run `make infra`.
+P_INFRA_CLOUDFRONT_SG_ID=
+
+# CloudFront + WAF front door (cdn.yaml) — MUST be us-east-1
+P_CDN_STACK=loom-cdn
+CDN_REGION=us-east-1
+# ACM certificate ARN in us-east-1 covering PUBLIC_FQDN (CloudFront viewer cert)
+P_CDN_CERT_ARN=<us-east-1-acm-cert-arn-for-public-fqdn>
 
 # ECR repository names
 P_ECR_FRONTEND_REPO=loom-frontend

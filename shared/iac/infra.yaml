@@ -13,7 +13,10 @@ Parameters:
     Description: VPC ID for ALB and ECS security groups
   pPublicSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: Public subnet IDs for ALB placement
+    Description: Public subnet IDs (kept for NAT/other public resources; ALB no longer uses them)
+  pPrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs for the internal ALB
   pDomainName:
     Type: String
     Description: Subdomain name for the application (e.g. loom.example.com)
@@ -28,9 +31,12 @@ Parameters:
     Type: String
     Description: ECR repository name for the backend image
     Default: loom-backend
-  pAlbIngressCidr:
+  pCloudFrontVpcOriginSgId:
     Type: String
-    Description: CIDR block allowed to reach the ALB on HTTPS
+    Default: ""
+    Description: >-
+      SG id of the auto-created CloudFront-VPCOrigins-Service-SG. Leave empty on
+      the first deploy; fill on the second pass after the CloudFront VPC origin exists.
   pTagApplication:
     Type: String
     Description: Value for the loom:application tag
@@ -40,6 +46,10 @@ Parameters:
   pTagOwner:
     Type: String
     Description: Value for the loom:owner tag
+
+Conditions:
+  # True once the CloudFront VPC origin exists and its service SG id is supplied.
+  HasCloudFrontSg: !Not [!Equals [!Ref pCloudFrontVpcOriginSgId, ""]]
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -234,16 +244,12 @@ Resources:
       checkov:
         skip:
           - id: CKV_AWS_260
-            comment: ALB requires open ingress for public HTTPS access
+            comment: Ingress is restricted to the CloudFront VPC origin SG (see AlbIngressFromCloudFront)
     Properties:
       GroupDescription: Allow inbound HTTPS traffic to the ALB
       VpcId: !Ref pVpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: !Ref pAlbIngressCidr
-          Description: Allow inbound HTTPS from allowed clients
+      # Ingress is attached separately via AlbIngressFromCloudFront so this SG can
+      # exist before the CloudFront VPC origin (and its service SG) that it references.
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-alb-sg"
@@ -253,6 +259,17 @@ Resources:
           Value: !Ref pTagGroup
         - Key: loom:owner
           Value: !Ref pTagOwner
+
+  AlbIngressFromCloudFront:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCloudFrontSg
+    Properties:
+      GroupId: !GetAtt AlbSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref pCloudFrontVpcOriginSgId
+      Description: Allow inbound HTTPS only from the CloudFront VPC origin
 
   EcsSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -282,9 +299,9 @@ Resources:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
       Name: !Sub "${AWS::StackName}-alb"
-      Scheme: internet-facing
+      Scheme: internal
       Type: application
-      Subnets: !Ref pPublicSubnetIds
+      Subnets: !Ref pPrivateSubnetIds
       SecurityGroups:
         - !GetAtt AlbSecurityGroup.GroupId
       LoadBalancerAttributes:
@@ -388,17 +405,9 @@ Resources:
           TargetGroupArn: !Ref BackendTargetGroup
 
   # ---------------------------------------------------------------------------
-  # Route 53 — DNS alias record for ALB
+  # Route 53 — the public FQDN now points at CloudFront (see cdn.yaml), not the
+  # internal ALB. The ALB is reachable only through the CloudFront VPC origin.
   # ---------------------------------------------------------------------------
-  DnsRecord:
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !Ref pHostedZoneId
-      Name: !Ref pDomainName
-      Type: A
-      AliasTarget:
-        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
-        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
 
 Outputs:
   oArtifactBucket:

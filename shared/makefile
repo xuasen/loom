@@ -245,11 +245,12 @@ infra.deploy:
 			pLoggingBucketName=$(P_LOOM_LOGGING_BUCKET) \
 			pVpcId=$(P_INFRA_VPC_ID) \
 			pPublicSubnetIds=$(P_INFRA_PUBLIC_SUBNET_IDS) \
+			pPrivateSubnetIds=$(P_INFRA_PRIVATE_SUBNET_IDS) \
 			pDomainName=$(P_INFRA_DOMAIN_NAME) \
 			pHostedZoneId=$(O_INFRA_HOSTED_ZONE_ID) \
 			pFrontendRepoName=$(P_ECR_FRONTEND_REPO) \
 			pBackendRepoName=$(P_ECR_BACKEND_REPO) \
-			pAlbIngressCidr=$(P_INFRA_ALB_INGRESS_CIDR) \
+			pCloudFrontVpcOriginSgId=$(P_INFRA_CLOUDFRONT_SG_ID) \
 			pTagApplication=$(P_TAG_APPLICATION) \
 			pTagGroup=$(P_TAG_GROUP) \
 			pTagOwner=$(P_TAG_OWNER) \
@@ -268,6 +269,39 @@ infra.delete:
 		--profile $(PROFILE) \
 		--region $(REGION) \
 		--stack-name $(P_INFRA_STACK) \
+		--no-prompts
+
+# CloudFront + WAF front door (MUST deploy in us-east-1 — CDN_REGION)
+cdn.deploy:
+	sam deploy \
+		--profile $(PROFILE) \
+		--region $(CDN_REGION) \
+		--template-file iac/cdn.yaml \
+		--stack-name $(P_CDN_STACK) \
+		--resolve-s3 \
+		--parameter-overrides \
+			pAlbArn=$(O_INFRA_ALB_ARN) \
+			pPublicFqdn=$(P_INFRA_DOMAIN_NAME) \
+			pHostedZoneId=$(O_INFRA_HOSTED_ZONE_ID) \
+			pCfCertArn=$(P_CDN_CERT_ARN) \
+			pTagApplication=$(P_TAG_APPLICATION) \
+			pTagGroup=$(P_TAG_GROUP) \
+			pTagOwner=$(P_TAG_OWNER) \
+		--no-confirm-changeset
+
+cdn.outputs:
+	@aws cloudformation describe-stacks \
+		--profile $(PROFILE) \
+		--region $(CDN_REGION) \
+		--stack-name $(P_CDN_STACK) \
+		--query 'Stacks[0].Outputs' \
+		--output json | jq .
+
+cdn.delete:
+	sam delete \
+		--profile $(PROFILE) \
+		--region $(CDN_REGION) \
+		--stack-name $(P_CDN_STACK) \
 		--no-prompts
 
 # PrivateLink ingress (NLB + VPC Endpoint Service — deployed separately by networking team)

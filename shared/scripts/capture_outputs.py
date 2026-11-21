@@ -33,6 +33,7 @@ OUTPUT_MAP: dict[tuple[str, str], str] = {
     ("loom-infra", "oFrontendRepositoryUri"): "O_ECR_FRONTEND_URI",
     ("loom-infra", "oBackendRepositoryUri"): "O_ECR_BACKEND_URI",
     ("loom-infra", "oEcrKmsKeyArn"): "O_INFRA_ECR_KMS_KEY_ARN",
+    ("loom-infra", "oAlbArn"): "O_INFRA_ALB_ARN",
     # loom-cognito
     ("loom-cognito", "oCognitoUserPoolId"): "O_COGNITO_USER_POOL_ID",
     ("loom-cognito", "oUserClientId"): "O_COGNITO_USER_CLIENT_ID",
