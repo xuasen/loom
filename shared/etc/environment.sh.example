@@ -71,8 +71,10 @@ P_INFRA_CLOUDFRONT_SG_ID=
 # CloudFront + WAF front door (cdn.yaml) — MUST be us-east-1
 P_CDN_STACK=loom-cdn
 CDN_REGION=us-east-1
-# ACM certificate ARN in us-east-1 covering PUBLIC_FQDN (CloudFront viewer cert)
-P_CDN_CERT_ARN=<us-east-1-acm-cert-arn-for-public-fqdn>
+# ACM certificate in us-east-1 covering PUBLIC_FQDN (CloudFront viewer cert).
+# When REGION is us-east-1, loom-infra's own certificate (same FQDN) is reused;
+# otherwise set an explicit us-east-1 certificate ARN here.
+P_CDN_CERT_ARN=$(O_INFRA_CERT_ARN)
 
 # ECR repository names
 P_ECR_FRONTEND_REPO=loom-frontend

@@ -15,6 +15,7 @@ O_ECR_FRONTEND_URI=<oFrontendRepositoryUri>
 O_ECR_BACKEND_URI=<oBackendRepositoryUri>
 O_INFRA_ECR_KMS_KEY_ARN=<oEcrKmsKeyArn>
 O_INFRA_ALB_ARN=<oAlbArn>
+O_INFRA_CERT_ARN=<oCertificateArn>
 # loom-cognito: oCognitoUserPoolId, oUserClientId
 O_COGNITO_USER_POOL_ID=<oCognitoUserPoolId>
 O_COGNITO_USER_CLIENT_ID=<oUserClientId>
