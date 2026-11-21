@@ -128,6 +128,7 @@ P_GUARDRAIL_VERSION_DESCRIPTION=initial
 
 # Loom configurations
 P_LOOM_ARTIFACT_BUCKET=$(LOOM_ARTIFACT_BUCKET)
+P_LOOM_LOGGING_BUCKET=$(LOOM_LOGGING_BUCKET)
 
 # Common configurations
 include etc/common.sh

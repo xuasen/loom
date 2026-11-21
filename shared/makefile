@@ -250,7 +250,7 @@ infra.deploy:
 			pHostedZoneId=$(O_INFRA_HOSTED_ZONE_ID) \
 			pFrontendRepoName=$(P_ECR_FRONTEND_REPO) \
 			pBackendRepoName=$(P_ECR_BACKEND_REPO) \
-			pCloudFrontVpcOriginSgId=$(P_INFRA_CLOUDFRONT_SG_ID) \
+			$(if $(P_INFRA_CLOUDFRONT_SG_ID),pCloudFrontVpcOriginSgId=$(P_INFRA_CLOUDFRONT_SG_ID)) \
 			pTagApplication=$(P_TAG_APPLICATION) \
 			pTagGroup=$(P_TAG_GROUP) \
 			pTagOwner=$(P_TAG_OWNER) \
@@ -278,7 +278,8 @@ cdn.deploy:
 		--region $(CDN_REGION) \
 		--template-file iac/cdn.yaml \
 		--stack-name $(P_CDN_STACK) \
-		--resolve-s3 \
+		--s3-bucket $(BUCKET) \
+		--s3-prefix $(P_CDN_STACK) \
 		--parameter-overrides \
 			pAlbArn=$(O_INFRA_ALB_ARN) \
 			pPublicFqdn=$(P_INFRA_DOMAIN_NAME) \
