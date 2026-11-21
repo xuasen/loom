@@ -88,7 +88,7 @@ P_EC2_STACK=loom-ec2
 P_EC2_TEMPLATE=iac/ec2.yaml
 P_EC2_OUTPUT=iac/ec2_output.yaml
 P_EC2_INSTANCE_TYPE=t3.micro
-P_EC2_PUBLIC_SUBNET_ID=$(shell echo "$(PUBLIC_SUBNET_IDS)" | cut -d, -f1)
+P_EC2_PRIVATE_SUBNET_ID=$(shell echo "$(PRIVATE_SUBNET_IDS)" | cut -d, -f1)
 
 # ECS backend stack configuration
 P_ECS_BACKEND_STACK=loom-ecs-backend

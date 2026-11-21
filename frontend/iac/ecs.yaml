@@ -12,9 +12,9 @@ Parameters:
   pTargetGroupArn:
     Type: String
     Description: ARN of the frontend ALB target group (from infra stack output oFrontendTargetGroupArn)
-  pPublicSubnetIds:
+  pPrivateSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: Public subnet IDs for frontend ECS tasks
+    Description: Private subnet IDs for frontend ECS tasks (egress via NAT, reached only through the internal ALB)
   pImageUri:
     Type: String
     Description: ECR image URI for the frontend container
@@ -199,8 +199,8 @@ Resources:
       LaunchType: FARGATE
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
-          Subnets: !Ref pPublicSubnetIds
+          AssignPublicIp: DISABLED
+          Subnets: !Ref pPrivateSubnetIds
           SecurityGroups:
             - !Ref pEcsSecurityGroupId
       LoadBalancers:

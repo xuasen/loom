@@ -45,7 +45,7 @@ ecs.deploy:
 			pEcsClusterArn=$(O_ECS_CLUSTER_ARN) \
 			pEcsSecurityGroupId=$(O_INFRA_ECS_SG_ID) \
 			pTargetGroupArn=$(O_INFRA_FRONTEND_TG_ARN) \
-			pPublicSubnetIds=$(P_ECS_PUBLIC_SUBNET_IDS) \
+			pPrivateSubnetIds=$(P_ECS_PRIVATE_SUBNET_IDS) \
 			pImageUri=$(O_ECR_FRONTEND_URI):$(IMAGE_TAG) \
 			pCpu=$(P_ECS_FRONTEND_CPU) \
 			pMemory=$(P_ECS_FRONTEND_MEMORY) \
