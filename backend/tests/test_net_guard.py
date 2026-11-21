@@ -305,3 +305,29 @@ class TestGetTrustedOauthHosts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPinnedAddressPrefersIpv4(unittest.TestCase):
+    """A dual-stack hostname must pin IPv4 so IPv4-only VPCs can connect."""
+
+    def test_ipv4_chosen_over_ipv6(self) -> None:
+        from app.services.net_guard import _resolve_and_validate
+
+        infos = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2600:1f18:257:8001::1", 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("52.2.30.133", 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2600:1f18:257:8000::2", 0, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("35.171.139.60", 0)),
+        ]
+        with patch("socket.getaddrinfo", return_value=infos):
+            for _ in range(20):
+                pinned = _resolve_and_validate("cognito-idp.us-east-1.amazonaws.com")
+                self.assertNotIn(":", pinned)
+                self.assertEqual(pinned, "35.171.139.60")
+
+    def test_ipv6_only_still_resolves(self) -> None:
+        from app.services.net_guard import _resolve_and_validate
+
+        infos = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2600:1f18:257:8001::1", 0, 0, 0))]
+        with patch("socket.getaddrinfo", return_value=infos):
+            self.assertEqual(_resolve_and_validate("v6only.example.com"), "2600:1f18:257:8001::1")

@@ -150,7 +150,15 @@ def _resolve_and_validate(hostname: str, *, allow_private: bool = False) -> str:
         if is_disallowed(ip):
             raise SSRFBlockedError(f"{hostname!r} resolves to disallowed address {ip_str}")
 
-    return next(iter(resolved_ips))
+    # Pick deterministically, preferring IPv4. ``resolved_ips`` is a set, so
+    # taking an arbitrary member could pin an IPv6 address on an IPv4-only
+    # VPC (the default for Loom's private subnets), failing the connection
+    # with ENETUNREACH at random — e.g. Cognito JWKS fetches, which turns
+    # every authenticated request into a 401.
+    ipv4 = sorted(ip for ip in resolved_ips if ":" not in ip)
+    if ipv4:
+        return ipv4[0]
+    return sorted(resolved_ips)[0]
 
 
 def _validate_url(url: str, *, require_https: bool, allow_private: bool) -> tuple[urllib.parse.ParseResult, str]:
