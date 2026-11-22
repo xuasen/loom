@@ -1,0 +1,89 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Loom Claude task runner data plane. Tasks, their event streams and worker
+  heartbeats live in DynamoDB; the backend pushes task/control notifications to
+  workers over AWS IoT Core (no IoT resources needed: workers connect with IAM
+  SigV4, so access is governed by IAM policies on the worker and backend roles).
+
+Parameters:
+  pEventRetentionDays:
+    Type: Number
+    Default: 365
+    Description: Events expire (DynamoDB TTL) this many days after they are written
+  pTagApplication:
+    Type: String
+    Default: loom
+  pTagGroup:
+    Type: String
+    Default: loom
+  pTagOwner:
+    Type: String
+    Default: ""
+
+Resources:
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: loom-claude-tasks
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: task_id, AttributeType: S }
+        - { AttributeName: kind, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+      KeySchema:
+        - { AttributeName: task_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by_created
+          KeySchema:
+            - { AttributeName: kind, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+      Tags:
+        - { Key: loom:application, Value: !Ref pTagApplication }
+        - { Key: loom:group, Value: !Ref pTagGroup }
+        - { Key: loom:owner, Value: !Ref pTagOwner }
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: loom-claude-events
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: task_id, AttributeType: S }
+        - { AttributeName: seq, AttributeType: N }
+      KeySchema:
+        - { AttributeName: task_id, KeyType: HASH }
+        - { AttributeName: seq, KeyType: RANGE }
+      TimeToLiveSpecification: { AttributeName: expires_at, Enabled: true }
+      SSESpecification: { SSEEnabled: true }
+      Tags:
+        - { Key: loom:application, Value: !Ref pTagApplication }
+        - { Key: loom:group, Value: !Ref pTagGroup }
+        - { Key: loom:owner, Value: !Ref pTagOwner }
+
+  WorkersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: loom-claude-workers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: worker_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: worker_id, KeyType: HASH }
+      SSESpecification: { SSEEnabled: true }
+      Tags:
+        - { Key: loom:application, Value: !Ref pTagApplication }
+        - { Key: loom:group, Value: !Ref pTagGroup }
+        - { Key: loom:owner, Value: !Ref pTagOwner }
+
+Outputs:
+  oTasksTable: { Value: !Ref TasksTable }
+  oEventsTable: { Value: !Ref EventsTable }
+  oWorkersTable: { Value: !Ref WorkersTable }
+  oEventRetentionDays: { Value: !Ref pEventRetentionDays }

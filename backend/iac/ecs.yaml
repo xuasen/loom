@@ -99,6 +99,14 @@ Parameters:
   pSecretsKmsKeyArn:
     Type: String
     Description: ARN of the KMS key used to encrypt Secrets Manager secrets (from rds stack output oSecretsKmsKeyArn)
+  pClaudeIotEndpoint:
+    Type: String
+    Description: AWS IoT Core data (ATS) endpoint for the Claude task runner (leave empty to disable /api/claude)
+    Default: ""
+  pClaudeDefaultWorker:
+    Type: String
+    Description: Worker ID tasks go to when the caller names none
+    Default: loom-worker-1
   pTagApplication:
     Type: String
     Description: Value for the loom:application tag
@@ -111,6 +119,7 @@ Parameters:
 
 Conditions:
   CognitoRegionEmpty: !Equals [!Ref pCognitoRegion, ""]
+  HasClaude: !Not [!Equals [!Ref pClaudeIotEndpoint, ""]]
   HasLitellmProxyApiKey: !Not [!Equals [!Ref pLitellmProxyApiKeySecretArn, ""]]
   HasLitellmProxyApiKeySecretKmsKey: !Not [!Equals [!Ref pLitellmProxyApiKeySecretKmsKeyArn, ""]]
 
@@ -556,6 +565,33 @@ Resources:
                   - cloudformation:DescribeStackEvents
                   - cloudformation:ListStacks
                 Resource: !Sub "arn:aws:cloudformation:*:${AWS::AccountId}:stack/loom-role-*"
+        - !If
+          - HasClaude
+          - PolicyName: ClaudeTaskRunnerPolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                    - dynamodb:PutItem
+                    - dynamodb:UpdateItem
+                    - dynamodb:Query
+                  Resource:
+                    - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/loom-claude-tasks"
+                    - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/loom-claude-tasks/index/by_created"
+                - Effect: Allow
+                  Action: dynamodb:Query
+                  Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/loom-claude-events"
+                - Effect: Allow
+                  Action: dynamodb:Scan
+                  Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/loom-claude-workers"
+                - Effect: Allow
+                  Action: iot:Publish
+                  Resource:
+                    - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/loom/claude/tasks/*"
+                    - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/loom/claude/control/*"
+          - !Ref AWS::NoValue
       Tags:
         - Key: loom:application
           Value: !Ref pTagApplication
@@ -619,6 +655,16 @@ Resources:
               Value: !Ref pLitellmProxyBaseUrl
             - Name: LOOM_LITELLM_DISCOVERY_BASE_URL
               Value: !Ref pLitellmDiscoveryBaseUrl
+            - Name: LOOM_CLAUDE_IOT_ENDPOINT
+              Value: !Ref pClaudeIotEndpoint
+            - Name: LOOM_CLAUDE_TASKS_TABLE
+              Value: !If [HasClaude, loom-claude-tasks, ""]
+            - Name: LOOM_CLAUDE_EVENTS_TABLE
+              Value: loom-claude-events
+            - Name: LOOM_CLAUDE_WORKERS_TABLE
+              Value: loom-claude-workers
+            - Name: LOOM_CLAUDE_DEFAULT_WORKER
+              Value: !Ref pClaudeDefaultWorker
             - Name: LOG_LEVEL
               Value: info
           Secrets: !If

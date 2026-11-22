@@ -122,6 +122,12 @@ P_LITELLM_DISCOVERY_BASE_URL=<optional; defaults to P_LITELLM_PROXY_BASE_URL. Lo
 P_LITELLM_PROXY_API_KEY_SECRET_ARN=<arn:aws:secretsmanager:region:account:secret:name>
 P_LITELLM_PROXY_API_KEY_SECRET_KMS_KEY_ARN=<arn:aws:kms:region:account:key/key-id (leave empty if default key)>
 
+# Claude task runner (/api/claude). Deploy shared/iac/claude.yaml first, then set
+# the IoT data endpoint: aws iot describe-endpoint --endpoint-type iot:Data-ATS
+# Leave P_CLAUDE_IOT_ENDPOINT empty to disable.
+P_CLAUDE_IOT_ENDPOINT=
+P_CLAUDE_DEFAULT_WORKER=loom-worker-1
+
 # AgentCore memory queries (used by make agentcore.memory.* targets)
 P_MEMORY_ID=<your-memory-id>
 P_MEMORY_ACTOR_ID=<cognito-username-or-sub>
