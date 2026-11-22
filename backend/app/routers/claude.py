@@ -387,10 +387,11 @@ def list_sessions(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> d
     resp = _sessions().query(
         IndexName="by_created",
         KeyConditionExpression=Key("kind").eq(KIND),
+        FilterExpression=Attr("deleted").ne(True),
         ScanIndexForward=False,
-        Limit=100,
+        Limit=200,
     )
-    return {"sessions": [_public(i) for i in resp.get("Items", [])]}
+    return {"sessions": [_public(i) for i in resp.get("Items", [])][:100]}
 
 
 class CreateSessionRequest(BaseModel):
@@ -959,3 +960,26 @@ def delete_schedule(schedule_id: str, user: UserInfo = Depends(require_scopes(RE
         ExpressionAttributeValues={":y": True, ":f": False, ":t": _now_iso()},
     )
     logger.info("Claude schedule %s deleted by %s", item["task_id"], user.username)
+
+
+@router.post("/sessions/{session_id}/delete", status_code=204)
+def delete_session(session_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> None:
+    """Remove a session from the list (ends it first if it is still open).
+
+    Soft delete: the record is flagged and hidden; its events expire with the
+    events table TTL and attachments with the files bucket lifecycle. Only the
+    session's owner may delete it.
+    """
+    _require_enabled()
+    item = _get_item(session_id)
+    if item.get("submitted_by") != user.username:
+        raise HTTPException(status_code=403, detail="Only the session owner can delete it")
+    if item.get("status") not in CLOSED_STATES:
+        close(session_id, user)
+    _sessions().update_item(
+        Key={"task_id": session_id},
+        UpdateExpression="SET #d = :y, #da = :t, #db = :u",
+        ExpressionAttributeNames={"#d": "deleted", "#da": "deleted_at", "#db": "deleted_by"},
+        ExpressionAttributeValues={":y": True, ":t": _now_iso(), ":u": user.username},
+    )
+    logger.info("Claude session %s deleted by %s", session_id, user.username)

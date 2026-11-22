@@ -328,6 +328,10 @@ export function interruptClaudeSession(id: string): Promise<void> {
   return apiFetch<void>(path(id, "/interrupt"), { method: "POST" });
 }
 
+export function deleteClaudeSession(id: string): Promise<void> {
+  return apiFetch<void>(path(id, "/delete"), { method: "POST" });
+}
+
 export function closeClaudeSession(id: string): Promise<void> {
   return apiFetch<void>(path(id, "/close"), { method: "POST" });
 }

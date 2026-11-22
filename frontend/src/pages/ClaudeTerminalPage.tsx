@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle, ArrowDown, Bell, BellOff, Check, ChevronLeft, ChevronRight, Clock, CornerDownRight, FileText,
-  Folder, Loader2, Paperclip, Plus, RefreshCw, Send, Shield, Sparkles, Square, SquareTerminal, X, XCircle,
+  Folder, Loader2, Paperclip, Plus, RefreshCw, Send, Shield, Sparkles, Square, SquareTerminal, Trash2, X, XCircle,
 } from "lucide-react";
 import { ClaudeSchedulesPanel } from "@/components/ClaudeSchedulesPanel";
 import { toast } from "sonner";
@@ -16,6 +16,7 @@ import {
   createClaudeSession,
   currentPushSubscription,
   decideClaudeApproval,
+  deleteClaudeSession,
   disablePush,
   enablePush,
   getClaudeConfig,
@@ -638,6 +639,23 @@ export function ClaudeTerminalPage() {
     }
   };
 
+  const deleteSession = async () => {
+    if (!selectedId) return;
+    const title = selected?.title || "this session";
+    if (!window.confirm(`Delete "${title.slice(0, 60)}"? It is ended first if still running, and removed from the list.`)) {
+      return;
+    }
+    try {
+      await deleteClaudeSession(selectedId);
+      setSessions((prev) => prev.filter((s) => s.session_id !== selectedId));
+      setSelectedId(null);
+      setShowConversation(false);
+      toast.success("Session deleted");
+    } catch (e) {
+      toast.error(`Could not delete: ${(e as Error).message}`);
+    }
+  };
+
   const decide = async (approvalId: string, decision: "allow" | "deny") => {
     if (!selectedId) return;
     try {
@@ -786,6 +804,18 @@ export function ClaudeTerminalPage() {
         <Button size="sm" variant="ghost" onClick={() => void endSession()} className="text-muted-foreground">
           <XCircle className="h-4 w-4" />
           <span className="hidden sm:inline">End</span>
+        </Button>
+      )}
+      {selectedId && (
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          onClick={() => void deleteSession()}
+          className="text-muted-foreground hover:text-destructive"
+          aria-label="Delete session"
+          title="Delete session"
+        >
+          <Trash2 className="h-4 w-4" />
         </Button>
       )}
     </div>
