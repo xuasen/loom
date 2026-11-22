@@ -65,7 +65,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now loom-claude-worker
+systemctl enable loom-claude-worker
+# restart (not just start) so re-running this script upgrades a running worker
+systemctl restart loom-claude-worker
 sleep 3
 systemctl --no-pager status loom-claude-worker | head -15
 echo "Logs: journalctl -u loom-claude-worker -f"
