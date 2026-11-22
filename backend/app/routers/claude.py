@@ -1,22 +1,22 @@
-"""Claude task runner API (/api/claude/*).
+"""Claude sessions API (/api/claude/*).
 
-Tasks run on private worker hosts that only make outbound connections. This
-router is the only writer of task records and the only publisher of task and
-control notifications; workers are the only writers of events.
+A *session* is one ongoing Claude Code conversation on a private worker host,
+like a terminal running ``claude``: the user sends messages, each one is a turn,
+and context carries over. Workers only make outbound connections.
 
-Trust model (no shared secrets minted by Loom):
-- Callers authenticate with the Loom/Cognito JWT and need ``admin:write``.
-  External hooks use a Cognito machine-to-machine token for the same routes.
-- The DynamoDB task record written here is authoritative. An IoT message only
-  tells a worker *which* task to look at; the worker reads the prompt, mode and
-  parent from DynamoDB and claims the task with a conditional QUEUED->RUNNING
-  update, so a forged or replayed message cannot inject a prompt or run a task
-  twice. IAM limits who may publish to the worker topics at all.
-- Approvals and cancels are recorded on the task item first, then pushed, so a
-  worker that missed the push still sees them on its next poll.
+Data (table loom-claude-tasks, key ``task_id`` = session id, ``kind="session"``):
+- ``inbox``: list of user messages appended by this router; ``consumed``: how
+  many the worker has taken; ``pending_count``: inbox - consumed (for queries).
+- ``status``: IDLE | RUNNING | WAITING_APPROVAL | CLOSED | FAILED.
+- ``decisions`` / ``interrupt_requested`` / ``close_requested``: control state
+  written here first, then pushed over IoT, so a worker that missed a push still
+  sees it on its next poll.
+Events (table loom-claude-events) are written only by the worker, numbered by
+``seq`` per session, so the whole conversation can be replayed.
 
-Topics: loom/claude/tasks/<worker_id>  (payload {"task_id"})
-        loom/claude/control/<worker_id> (payload {"type","task_id",...})
+Trust model: callers need a valid Loom/Cognito JWT with ``admin:write``. The
+DynamoDB record is authoritative; an IoT message only names a session. IAM
+limits who may publish to worker topics.
 """
 from __future__ import annotations
 
@@ -44,11 +44,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/claude", tags=["claude"])
 
 REQUIRED_SCOPE = "admin:write"
-TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
-MAX_PROMPT_CHARS = 20000
-MAX_OPEN_TASKS_PER_USER = 5
+KIND = "session"
+CLOSED_STATES = {"CLOSED", "FAILED"}
+MAX_MESSAGE_CHARS = 20000
+MAX_INBOX = 500
+MAX_OPEN_SESSIONS_PER_USER = 10
 WORKER_ONLINE_SECONDS = 90
-STREAM_POLL_SECONDS = 0.7
+STREAM_POLL_SECONDS = 0.5
 STREAM_KEEPALIVE_SECONDS = 15
 STREAM_MAX_SECONDS = 15 * 60
 
@@ -76,7 +78,7 @@ def _table(env_name: str, default: str):
     return _ddb.Table(_env(env_name, default))
 
 
-def _tasks():
+def _sessions():
     return _table("LOOM_CLAUDE_TASKS_TABLE", "loom-claude-tasks")
 
 
@@ -97,8 +99,14 @@ def _publish(topic: str, payload: dict) -> None:
     _iot.publish(topic=topic, qos=1, payload=json.dumps(payload).encode())
 
 
+def _notify(worker_id: str, channel: Literal["tasks", "control"], payload: dict) -> None:
+    try:
+        _publish(f"loom/claude/{channel}/{worker_id}", payload)
+    except Exception as e:  # noqa: BLE001 - the worker also polls DynamoDB
+        logger.warning("IoT publish to %s/%s failed (worker poll will catch up): %s", channel, worker_id, e)
+
+
 def _plain(value: Any) -> Any:
-    """DynamoDB Decimals/sets -> JSON-friendly values."""
     if isinstance(value, Decimal):
         return int(value) if value == value.to_integral_value() else float(value)
     if isinstance(value, dict):
@@ -108,36 +116,51 @@ def _plain(value: Any) -> Any:
     return value
 
 
-_PUBLIC_TASK_FIELDS = (
-    "task_id", "prompt", "status", "mode", "submitted_by", "worker_id", "created_at",
-    "started_at", "finished_at", "last_seq", "result_summary", "parent_task_id",
-)
-
-
-def _public_task(item: dict) -> dict:
-    out = {k: _plain(item.get(k)) for k in _PUBLIC_TASK_FIELDS}
-    out["last_seq"] = out.get("last_seq") or 0
-    return out
+def _public(item: dict) -> dict:
+    inbox = item.get("inbox") or []
+    first = inbox[0].get("text", "") if inbox and isinstance(inbox[0], dict) else ""
+    return {
+        "session_id": item.get("task_id"),
+        "title": item.get("title") or first[:120],
+        "status": item.get("status"),
+        "mode": item.get("mode"),
+        "submitted_by": item.get("submitted_by"),
+        "worker_id": item.get("worker_id"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "last_seq": _plain(item.get("last_seq") or 0),
+        "pending_count": _plain(item.get("pending_count") or 0),
+        "turns": _plain(item.get("consumed") or 0),
+        "cost_usd": _plain(item.get("cost_usd")) if item.get("cost_usd") is not None else None,
+    }
 
 
 def _require_enabled() -> None:
     if not _enabled():
-        raise HTTPException(status_code=404, detail="Claude task runner is not configured")
+        raise HTTPException(status_code=404, detail="Claude sessions are not configured")
 
 
-def _get_task_item(task_id: str) -> dict:
+def _get_item(session_id: str) -> dict:
     try:
-        item = _tasks().get_item(Key={"task_id": task_id}, ConsistentRead=True).get("Item")
+        item = _sessions().get_item(Key={"task_id": session_id}, ConsistentRead=True).get("Item")
     except ClientError as e:
-        logger.error("get_item %s failed: %s", task_id, e)
-        raise HTTPException(status_code=502, detail="Task store unavailable") from e
-    if not item or item.get("kind") != "task":
-        raise HTTPException(status_code=404, detail="Task not found")
+        logger.error("get_item %s failed: %s", session_id, e)
+        raise HTTPException(status_code=502, detail="Session store unavailable") from e
+    if not item or item.get("kind") != KIND:
+        raise HTTPException(status_code=404, detail="Session not found")
     return item
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _message(text: str, user: UserInfo) -> dict:
+    return {"id": uuid.uuid4().hex[:12], "text": text, "by": user.username, "at": _now_iso()}
+
+
+def _conditional_failed(e: ClientError) -> bool:
+    return e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
 
 
 # ---------------------------------------------------------------------------
@@ -153,96 +176,121 @@ def get_config(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict
     except ClientError as e:
         logger.warning("workers scan failed: %s", e)
         items = []
-    workers = []
-    for w in items:
-        hb = float(w.get("last_heartbeat_epoch") or 0)
-        workers.append({
-            "worker_id": w.get("worker_id"),
-            "online": now - hb < WORKER_ONLINE_SECONDS,
-            "last_heartbeat": w.get("last_heartbeat"),
-        })
+    workers = [{
+        "worker_id": w.get("worker_id"),
+        "online": now - float(w.get("last_heartbeat_epoch") or 0) < WORKER_ONLINE_SECONDS,
+        "last_heartbeat": w.get("last_heartbeat"),
+        "model": w.get("model"),
+    } for w in items]
     default_worker = _env("LOOM_CLAUDE_DEFAULT_WORKER", "loom-worker-1")
     if not any(w["worker_id"] == default_worker for w in workers):
-        workers.append({"worker_id": default_worker, "online": False, "last_heartbeat": None})
+        workers.append({"worker_id": default_worker, "online": False, "last_heartbeat": None, "model": None})
     return {"enabled": True, "workers": workers}
 
 
-@router.get("/tasks")
-def list_tasks(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
+@router.get("/sessions")
+def list_sessions(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
     _require_enabled()
-    resp = _tasks().query(
+    resp = _sessions().query(
         IndexName="by_created",
-        KeyConditionExpression=Key("kind").eq("task"),
+        KeyConditionExpression=Key("kind").eq(KIND),
         ScanIndexForward=False,
         Limit=100,
     )
-    return {"tasks": [_public_task(i) for i in resp.get("Items", [])]}
+    return {"sessions": [_public(i) for i in resp.get("Items", [])]}
 
 
-class CreateTaskRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
+class CreateSessionRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     mode: Literal["interactive", "unattended"] = "interactive"
     worker_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
-    parent_task_id: str | None = Field(default=None, max_length=64)
 
 
-@router.post("/tasks", status_code=201)
-def create_task(req: CreateTaskRequest, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
+@router.post("/sessions", status_code=201)
+def create_session(req: CreateSessionRequest, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
     _require_enabled()
     worker_id = req.worker_id or _env("LOOM_CLAUDE_DEFAULT_WORKER", "loom-worker-1")
 
-    if req.parent_task_id:
-        parent = _get_task_item(req.parent_task_id)
-        if parent.get("status") not in TERMINAL:
-            raise HTTPException(status_code=409, detail="Parent task is still running")
-        worker_id = parent.get("worker_id") or worker_id  # the session lives on that host
-
-    open_tasks = _tasks().query(
+    open_sessions = _sessions().query(
         IndexName="by_created",
-        KeyConditionExpression=Key("kind").eq("task"),
+        KeyConditionExpression=Key("kind").eq(KIND),
         FilterExpression=Attr("submitted_by").eq(user.username) & Attr("status").is_in(
-            ["QUEUED", "RUNNING", "WAITING_APPROVAL"]),
+            ["IDLE", "RUNNING", "WAITING_APPROVAL"]),
         ScanIndexForward=False,
         Limit=200,
     ).get("Items", [])
-    if len(open_tasks) >= MAX_OPEN_TASKS_PER_USER:
-        raise HTTPException(status_code=429, detail=f"At most {MAX_OPEN_TASKS_PER_USER} open tasks per user")
+    if len(open_sessions) >= MAX_OPEN_SESSIONS_PER_USER:
+        raise HTTPException(status_code=429,
+                            detail=f"At most {MAX_OPEN_SESSIONS_PER_USER} open sessions per user; end one first")
 
-    task_id = uuid.uuid4().hex[:16]
+    session_id = uuid.uuid4().hex[:16]
+    now = _now_iso()
     item = {
-        "task_id": task_id,
-        "kind": "task",
-        "prompt": req.prompt,
+        "task_id": session_id,
+        "kind": KIND,
+        "title": req.message[:120],
         "mode": req.mode,
-        "status": "QUEUED",
+        "status": "IDLE",
         "submitted_by": user.username,
         "worker_id": worker_id,
-        "created_at": _now_iso(),
+        "created_at": now,
+        "updated_at": now,
+        "inbox": [_message(req.message, user)],
+        "consumed": 0,
+        "pending_count": 1,
         "last_seq": 0,
         "decisions": {},
-        "cancel_requested": False,
+        "interrupt_requested": False,
+        "close_requested": False,
     }
-    if req.parent_task_id:
-        item["parent_task_id"] = req.parent_task_id
-    _tasks().put_item(Item=item, ConditionExpression="attribute_not_exists(task_id)")
-    logger.info("Claude task %s queued by %s for %s (mode=%s)", task_id, user.username, worker_id, req.mode)
-
-    try:
-        _publish(f"loom/claude/tasks/{worker_id}", {"task_id": task_id})
-    except Exception as e:  # noqa: BLE001 - worker also sweeps QUEUED tasks
-        logger.warning("IoT publish for task %s failed (worker sweep will pick it up): %s", task_id, e)
-    return _public_task(item)
+    _sessions().put_item(Item=item, ConditionExpression="attribute_not_exists(task_id)")
+    logger.info("Claude session %s opened by %s on %s (mode=%s)", session_id, user.username, worker_id, req.mode)
+    _notify(worker_id, "tasks", {"session_id": session_id})
+    return _public(item)
 
 
-@router.get("/tasks/{task_id}")
-def get_task(task_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
+@router.get("/sessions/{session_id}")
+def get_session(session_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
     _require_enabled()
-    return _public_task(_get_task_item(task_id))
+    return _public(_get_item(session_id))
 
 
-def _query_events(task_id: str, after: int, limit: int = 500) -> list[dict]:
+class SendMessageRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+
+
+@router.post("/sessions/{session_id}/messages", status_code=202)
+def send_message(
+    session_id: str,
+    req: SendMessageRequest,
+    user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE)),
+) -> dict:
+    """Queue the next user turn. Sending while a turn runs queues it (it runs next)."""
+    _require_enabled()
+    item = _get_item(session_id)
+    try:
+        resp = _sessions().update_item(
+            Key={"task_id": session_id},
+            UpdateExpression="SET inbox = list_append(inbox, :m), updated_at = :t ADD pending_count :one",
+            ConditionExpression="NOT (#s IN (:closed, :failed)) AND close_requested = :f AND size(inbox) < :max",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":m": [_message(req.message, user)], ":t": _now_iso(), ":one": 1,
+                ":closed": "CLOSED", ":failed": "FAILED", ":f": False, ":max": MAX_INBOX,
+            },
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as e:
+        if _conditional_failed(e):
+            raise HTTPException(status_code=409, detail="Session is closed or full") from e
+        raise
+    _notify(item["worker_id"], "tasks", {"session_id": session_id})
+    return _public(resp["Attributes"])
+
+
+def _query_events(session_id: str, after: int, limit: int = 1000) -> list[dict]:
     resp = _events().query(
-        KeyConditionExpression=Key("task_id").eq(task_id) & Key("seq").gt(after),
+        KeyConditionExpression=Key("task_id").eq(session_id) & Key("seq").gt(after),
         ScanIndexForward=True,
         Limit=limit,
     )
@@ -255,39 +303,53 @@ def _query_events(task_id: str, after: int, limit: int = 500) -> list[dict]:
     return out
 
 
-@router.get("/tasks/{task_id}/events")
+@router.get("/sessions/{session_id}/events")
 def get_events(
-    task_id: str,
+    session_id: str,
     after: int = Query(0, ge=0),
     user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE)),
 ) -> dict:
     _require_enabled()
-    task = _get_task_item(task_id)
-    return {"events": _query_events(task_id, after), "task_status": task.get("status")}
+    item = _get_item(session_id)
+    return {"events": _query_events(session_id, after), "status": item.get("status"),
+            "pending_count": _plain(item.get("pending_count") or 0)}
 
 
-@router.get("/tasks/{task_id}/stream")
+@router.get("/sessions/{session_id}/stream")
 async def stream_events(
-    task_id: str,
+    session_id: str,
     after: int = Query(0, ge=0),
     user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE)),
 ) -> StreamingResponse:
+    """SSE: events after ``after``, plus ``status`` frames when the session state changes.
+
+    Ends after STREAM_MAX_SECONDS (clients reconnect from their last seq) or
+    once the session is closed and fully delivered.
+    """
     _require_enabled()
-    await asyncio.to_thread(_get_task_item, task_id)  # 404 before opening the stream
+    await asyncio.to_thread(_get_item, session_id)
 
     async def gen():
         last = after
+        last_status = None
         started = time.monotonic()
         last_send = started
         while time.monotonic() - started < STREAM_MAX_SECONDS:
-            events = await asyncio.to_thread(_query_events, task_id, last)
+            events = await asyncio.to_thread(_query_events, session_id, last)
             for ev in events:
                 last = max(last, int(ev.get("seq", last)))
                 yield f"id: {last}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 last_send = time.monotonic()
             if not events:
-                task = await asyncio.to_thread(_get_task_item, task_id)
-                if task.get("status") in TERMINAL and int(_plain(task.get("last_seq") or 0)) <= last:
+                item = await asyncio.to_thread(_get_item, session_id)
+                status = item.get("status")
+                pending = _plain(item.get("pending_count") or 0)
+                if (status, pending) != last_status:
+                    last_status = (status, pending)
+                    frame = {"type": "session", "status": status, "pending_count": pending}
+                    yield f"event: session\ndata: {json.dumps(frame)}\n\n"
+                    last_send = time.monotonic()
+                if status in CLOSED_STATES and int(_plain(item.get("last_seq") or 0)) <= last:
                     return
                 if time.monotonic() - last_send > STREAM_KEEPALIVE_SECONDS:
                     yield ": keepalive\n\n"
@@ -305,9 +367,9 @@ class DecisionRequest(BaseModel):
     decision: Literal["allow", "deny"]
 
 
-@router.post("/tasks/{task_id}/approvals/{approval_id}", status_code=204)
+@router.post("/sessions/{session_id}/approvals/{approval_id}", status_code=204)
 def decide(
-    task_id: str,
+    session_id: str,
     approval_id: str,
     req: DecisionRequest,
     user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE)),
@@ -315,10 +377,10 @@ def decide(
     _require_enabled()
     if not approval_id.isalnum() or len(approval_id) > 64:
         raise HTTPException(status_code=400, detail="Bad approval id")
-    task = _get_task_item(task_id)
+    item = _get_item(session_id)
     try:
-        _tasks().update_item(
-            Key={"task_id": task_id},
+        _sessions().update_item(
+            Key={"task_id": session_id},
             UpdateExpression="SET decisions.#a = :d",
             ConditionExpression="#s = :waiting AND attribute_not_exists(decisions.#a)",
             ExpressionAttributeNames={"#a": approval_id, "#s": "status"},
@@ -328,45 +390,52 @@ def decide(
             },
         )
     except ClientError as e:
-        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            raise HTTPException(status_code=409, detail="Task is not waiting for this approval") from e
+        if _conditional_failed(e):
+            raise HTTPException(status_code=409, detail="Session is not waiting for this approval") from e
         raise
-    logger.info("Claude task %s approval %s -> %s by %s", task_id, approval_id, req.decision, user.username)
-    try:
-        _publish(f"loom/claude/control/{task['worker_id']}",
-                 {"type": "approval", "task_id": task_id, "approval_id": approval_id})
-    except Exception as e:  # noqa: BLE001 - worker polls the task item too
-        logger.warning("IoT publish (approval) failed: %s", e)
+    logger.info("Claude session %s approval %s -> %s by %s", session_id, approval_id, req.decision, user.username)
+    _notify(item["worker_id"], "control", {"type": "approval", "session_id": session_id})
 
 
-@router.post("/tasks/{task_id}/cancel", status_code=204)
-def cancel(task_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> None:
+@router.post("/sessions/{session_id}/interrupt", status_code=204)
+def interrupt(session_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> None:
+    """Stop the current turn (like Esc in the terminal). The session stays open."""
     _require_enabled()
-    task = _get_task_item(task_id)
-    if task.get("status") in TERMINAL:
+    item = _get_item(session_id)
+    if item.get("status") not in ("RUNNING", "WAITING_APPROVAL"):
         return
-    if task.get("status") == "QUEUED":
-        try:
-            _tasks().update_item(
-                Key={"task_id": task_id},
-                UpdateExpression="SET #s = :c, finished_at = :t, cancel_requested = :y",
-                ConditionExpression="#s = :q",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":c": "CANCELLED", ":t": _now_iso(), ":y": True, ":q": "QUEUED"},
-            )
-            logger.info("Claude task %s cancelled while queued by %s", task_id, user.username)
-            return
-        except ClientError as e:
-            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
-                raise
-            # it just started running: fall through to the running path
-    _tasks().update_item(
-        Key={"task_id": task_id},
-        UpdateExpression="SET cancel_requested = :y, cancel_requested_by = :u",
+    _sessions().update_item(
+        Key={"task_id": session_id},
+        UpdateExpression="SET interrupt_requested = :y, interrupt_by = :u",
         ExpressionAttributeValues={":y": True, ":u": user.username},
     )
-    logger.info("Claude task %s cancel requested by %s", task_id, user.username)
+    logger.info("Claude session %s interrupt requested by %s", session_id, user.username)
+    _notify(item["worker_id"], "control", {"type": "interrupt", "session_id": session_id})
+
+
+@router.post("/sessions/{session_id}/close", status_code=204)
+def close(session_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> None:
+    """End the session; the worker releases its Claude Code process."""
+    _require_enabled()
+    item = _get_item(session_id)
+    if item.get("status") in CLOSED_STATES:
+        return
     try:
-        _publish(f"loom/claude/control/{task['worker_id']}", {"type": "cancel", "task_id": task_id})
-    except Exception as e:  # noqa: BLE001
-        logger.warning("IoT publish (cancel) failed: %s", e)
+        _sessions().update_item(
+            Key={"task_id": session_id},
+            UpdateExpression="SET #s = :c, close_requested = :y, updated_at = :t",
+            ConditionExpression="#s = :idle AND pending_count = :zero",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":c": "CLOSED", ":y": True, ":t": _now_iso(), ":idle": "IDLE", ":zero": 0},
+        )
+    except ClientError as e:
+        if not _conditional_failed(e):
+            raise
+        # A turn is running or queued: ask the worker to stop and close.
+        _sessions().update_item(
+            Key={"task_id": session_id},
+            UpdateExpression="SET close_requested = :y, interrupt_requested = :y",
+            ExpressionAttributeValues={":y": True},
+        )
+    logger.info("Claude session %s closed by %s", session_id, user.username)
+    _notify(item["worker_id"], "control", {"type": "close", "session_id": session_id})

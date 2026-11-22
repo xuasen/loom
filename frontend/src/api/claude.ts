@@ -1,63 +1,53 @@
 import { apiFetch, getAuthToken, getBaseUrl, tryRefreshToken } from "./client";
 
 /**
- * Claude task runner API.
+ * Claude sessions API.
  *
- * Tasks run on a worker host that only makes outbound connections. The backend
- * signs a submitted task and hands it to the worker; the worker streams every
- * step back as a numbered event (seq) that is also stored, so a task keeps
- * running after the user signs out and its full history can be replayed.
- *
- * Reading a task = fetch history (`/events?after=0`), then follow the live
- * stream from the last seq; events are de-duplicated by seq.
+ * A session is one ongoing Claude Code conversation on a private worker (like a
+ * terminal running `claude`): each message is a turn and context carries over.
+ * The worker numbers every step (seq) and stores it, so a session keeps going
+ * after the user signs out and can be replayed. Reading a session = fetch
+ * history (`/events?after=0`), then follow the SSE stream from the last seq.
  */
 
-export type ClaudeTaskStatus =
-  | "QUEUED"
-  | "RUNNING"
-  | "WAITING_APPROVAL"
-  | "SUCCEEDED"
-  | "FAILED"
-  | "CANCELLED";
+export type ClaudeSessionStatus = "IDLE" | "RUNNING" | "WAITING_APPROVAL" | "CLOSED" | "FAILED";
+export type ClaudeSessionMode = "interactive" | "unattended";
 
-export type ClaudeTaskMode = "interactive" | "unattended";
+export const CLOSED_STATUSES: ReadonlySet<ClaudeSessionStatus> = new Set(["CLOSED", "FAILED"]);
 
-export const TERMINAL_STATUSES: ReadonlySet<ClaudeTaskStatus> = new Set([
-  "SUCCEEDED",
-  "FAILED",
-  "CANCELLED",
-]);
-
-export interface ClaudeTask {
-  task_id: string;
-  prompt: string;
-  status: ClaudeTaskStatus;
-  mode: ClaudeTaskMode;
+export interface ClaudeSession {
+  session_id: string;
+  title: string;
+  status: ClaudeSessionStatus;
+  mode: ClaudeSessionMode;
   submitted_by: string;
   worker_id: string;
   created_at: string;
-  started_at?: string | null;
-  finished_at?: string | null;
+  updated_at?: string | null;
   last_seq: number;
-  result_summary?: string | null;
-  parent_task_id?: string | null;
+  pending_count: number;
+  turns: number;
+  cost_usd?: number | null;
 }
 
 export type ClaudeEventType =
+  | "user_message"
   | "text"
   | "tool_use"
   | "tool_result"
   | "approval_request"
   | "approval_decision"
   | "status"
-  | "error"
-  | "result";
+  | "turn_end"
+  | "error";
 
 export interface ClaudeEvent {
   seq: number;
   ts: string;
   type: ClaudeEventType;
   text?: string;
+  partial?: boolean;
+  by?: string;
   tool?: string;
   input?: unknown;
   output?: string;
@@ -65,14 +55,16 @@ export interface ClaudeEvent {
   approval_id?: string;
   decision?: "allow" | "deny";
   decided_by?: string;
-  status?: ClaudeTaskStatus;
+  status?: ClaudeSessionStatus;
   message?: string;
+  cost_usd?: number;
 }
 
 export interface ClaudeWorker {
   worker_id: string;
   online: boolean;
   last_heartbeat?: string | null;
+  model?: string | null;
 }
 
 export interface ClaudeConfig {
@@ -80,70 +72,74 @@ export interface ClaudeConfig {
   workers: ClaudeWorker[];
 }
 
+export interface SessionStateFrame {
+  status: ClaudeSessionStatus;
+  pending_count: number;
+}
+
+const path = (id: string, suffix = "") => `/api/claude/sessions/${encodeURIComponent(id)}${suffix}`;
+
 export function getClaudeConfig(): Promise<ClaudeConfig> {
   return apiFetch<ClaudeConfig>("/api/claude/config");
 }
 
-export function listClaudeTasks(): Promise<{ tasks: ClaudeTask[] }> {
-  return apiFetch<{ tasks: ClaudeTask[] }>("/api/claude/tasks");
+export function listClaudeSessions(): Promise<{ sessions: ClaudeSession[] }> {
+  return apiFetch<{ sessions: ClaudeSession[] }>("/api/claude/sessions");
 }
 
-export function getClaudeTask(taskId: string): Promise<ClaudeTask> {
-  return apiFetch<ClaudeTask>(`/api/claude/tasks/${encodeURIComponent(taskId)}`);
+export function getClaudeSession(id: string): Promise<ClaudeSession> {
+  return apiFetch<ClaudeSession>(path(id));
 }
 
-export function createClaudeTask(body: {
-  prompt: string;
-  mode: ClaudeTaskMode;
+export function createClaudeSession(body: {
+  message: string;
+  mode: ClaudeSessionMode;
   worker_id?: string;
-  parent_task_id?: string;
-}): Promise<ClaudeTask> {
-  return apiFetch<ClaudeTask>("/api/claude/tasks", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
+}): Promise<ClaudeSession> {
+  return apiFetch<ClaudeSession>("/api/claude/sessions", { method: "POST", body: JSON.stringify(body) });
+}
+
+export function sendClaudeMessage(id: string, message: string): Promise<ClaudeSession> {
+  return apiFetch<ClaudeSession>(path(id, "/messages"), { method: "POST", body: JSON.stringify({ message }) });
 }
 
 export function getClaudeEvents(
-  taskId: string,
+  id: string,
   after: number,
-): Promise<{ events: ClaudeEvent[]; task_status: ClaudeTaskStatus }> {
-  return apiFetch(`/api/claude/tasks/${encodeURIComponent(taskId)}/events?after=${after}`);
+): Promise<{ events: ClaudeEvent[]; status: ClaudeSessionStatus; pending_count: number }> {
+  return apiFetch(path(id, `/events?after=${after}`));
 }
 
-export function decideClaudeApproval(
-  taskId: string,
-  approvalId: string,
-  decision: "allow" | "deny",
-): Promise<void> {
-  return apiFetch<void>(
-    `/api/claude/tasks/${encodeURIComponent(taskId)}/approvals/${encodeURIComponent(approvalId)}`,
-    { method: "POST", body: JSON.stringify({ decision }) },
-  );
+export function decideClaudeApproval(id: string, approvalId: string, decision: "allow" | "deny"): Promise<void> {
+  return apiFetch<void>(path(id, `/approvals/${encodeURIComponent(approvalId)}`), {
+    method: "POST",
+    body: JSON.stringify({ decision }),
+  });
 }
 
-export function cancelClaudeTask(taskId: string): Promise<void> {
-  return apiFetch<void>(`/api/claude/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" });
+export function interruptClaudeSession(id: string): Promise<void> {
+  return apiFetch<void>(path(id, "/interrupt"), { method: "POST" });
+}
+
+export function closeClaudeSession(id: string): Promise<void> {
+  return apiFetch<void>(path(id, "/close"), { method: "POST" });
 }
 
 /**
- * Follow the live event stream (Server-Sent Events over fetch, so the bearer
- * token travels in the Authorization header rather than the URL).
- * Resolves when the server ends the stream; rejects on network/HTTP errors.
+ * Follow the live stream (SSE over fetch so the bearer token stays in the
+ * Authorization header, not the URL). Resolves when the server ends the stream.
  */
 export async function streamClaudeEvents(
-  taskId: string,
+  id: string,
   after: number,
   onEvent: (event: ClaudeEvent) => void,
+  onState: (state: SessionStateFrame) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const url = `${getBaseUrl()}/api/claude/tasks/${encodeURIComponent(taskId)}/stream?after=${after}`;
+  const url = `${getBaseUrl()}${path(id, `/stream?after=${after}`)}`;
   const open = (token: string | null) =>
     fetch(url, {
-      headers: {
-        Accept: "text/event-stream",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
+      headers: { Accept: "text/event-stream", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       signal,
     });
 
@@ -152,9 +148,7 @@ export async function streamClaudeEvents(
     const refreshed = await tryRefreshToken();
     if (refreshed) response = await open(refreshed);
   }
-  if (!response.ok || !response.body) {
-    throw new Error(`stream HTTP ${response.status}`);
-  }
+  if (!response.ok || !response.body) throw new Error(`stream HTTP ${response.status}`);
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -167,16 +161,19 @@ export async function streamClaudeEvents(
     while (boundary !== -1) {
       const block = buffer.slice(0, boundary);
       buffer = buffer.slice(boundary + 2);
-      const data = block
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n");
-      if (data) {
+      let eventName = "message";
+      const dataLines: string[] = [];
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) eventName = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+      if (dataLines.length > 0) {
         try {
-          onEvent(JSON.parse(data) as ClaudeEvent);
+          const payload = JSON.parse(dataLines.join("\n")) as unknown;
+          if (eventName === "session") onState(payload as SessionStateFrame);
+          else onEvent(payload as ClaudeEvent);
         } catch {
-          // ignore malformed frame; history fetch will fill any gap
+          // ignore a malformed frame; the next history fetch fills any gap
         }
       }
       boundary = buffer.indexOf("\n\n");

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Loom Claude worker: runs Claude Code tasks queued by the Loom backend.
+"""Loom Claude worker: hosts Claude Code *sessions* for the Loom UI.
+
+A session is one ongoing Claude Code conversation, like a terminal running
+``claude``: each user message is a turn and context carries over. The worker
+keeps a live ClaudeSDKClient per active session (released after
+IDLE_RELEASE_SECONDS or when the session closes); the next message re-opens it
+with ``resume=<claude session id>``, so a conversation survives worker restarts.
 
 The host accepts no inbound connections. This process only connects out:
-- AWS IoT Core (MQTT over WSS, IAM SigV4) to be woken for new tasks, approvals
-  and cancels. IoT is only a wake-up signal; if it is down the worker still
-  works by polling DynamoDB every POLL_SECONDS.
-- DynamoDB: the task record (written by the backend) is authoritative. The
-  worker claims a task with a conditional QUEUED->RUNNING update, and is the
-  only writer of the task's numbered event stream.
+- AWS IoT Core (MQTT over WSS, IAM SigV4) to be woken for new messages,
+  approvals, interrupts and closes. IoT is only a wake-up signal; DynamoDB is
+  polled every POLL_SECONDS as a fallback.
+- DynamoDB: the session record (written by the backend) is authoritative. The
+  worker claims a turn with a conditional IDLE->RUNNING update and is the only
+  writer of the session's numbered event stream.
 - Amazon Bedrock, through Claude Code (Claude Agent SDK).
-
-Every step becomes an event {seq, ts, type, ...} so a task keeps running when
-nobody watches and the UI can replay it later.
 """
 from __future__ import annotations
 
@@ -46,14 +49,19 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-sonnet-4-6")
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
 APPROVAL_TIMEOUT_S = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", "1800"))
 EVENT_TTL_DAYS = int(os.environ.get("EVENT_TTL_DAYS", "365"))
-POLL_SECONDS = 30
+IDLE_RELEASE_SECONDS = int(os.environ.get("IDLE_RELEASE_SECONDS", "1800"))
+MAX_LIVE_SESSIONS = int(os.environ.get("MAX_LIVE_SESSIONS", "4"))
+POLL_SECONDS = 15
 HEARTBEAT_SECONDS = 30
+FLUSH_SECONDS = 0.3
+FLUSH_CHARS = 400
+KIND = "session"
 
 TOPIC_TASKS = f"loom/claude/tasks/{WORKER_ID}"
 TOPIC_CONTROL = f"loom/claude/control/{WORKER_ID}"
 
 ddb = boto3.resource("dynamodb", region_name=REGION)
-tasks_t = ddb.Table(TASKS_TABLE)
+sessions_t = ddb.Table(TASKS_TABLE)
 events_t = ddb.Table(EVENTS_TABLE)
 workers_t = ddb.Table(WORKERS_TABLE)
 
@@ -68,13 +76,12 @@ SENSITIVE_PATH = re.compile(
     r"(/\.aws(/|$)|/\.ssh(/|$)|(^|/)\.env(\.|$)|id_rsa|id_ed25519|/\.netrc$|\.git-credentials|"
     r"/\.config/gh(/|$)|/\.docker/config\.json|/etc/shadow|/proc/\d+/environ)"
 )
-# Always refused, whatever the mode: credential reads and environment dumps.
+# Always refused: credential reads, environment dumps, instance metadata.
 BASH_HARD_DENY = re.compile(
     r"(\.aws/|\.ssh/|\.git-credentials|\.netrc|\bprintenv\b|^\s*env\s*$|/proc/\S*environ|"
     r"169\.254\.169\.254|\bimds\b)"
 )
-# Refused in unattended mode (no human to ask): network egress, publishing,
-# privilege, and destructive patterns.
+# Refused in unattended mode (no human to ask).
 BASH_UNATTENDED_DENY = re.compile(
     r"(\b(curl|wget|nc|ncat|socat|ssh|scp|sftp|rsync|telnet|ftp)\b|git\s+push|\bsudo\b|\bsu\s|"
     r"\bdocker\b|\baws\s|rm\s+-rf\s+(/|~)(\s|$)|>\s*/dev/tcp|\bchmod\s+777\b|\bcrontab\b)"
@@ -121,8 +128,7 @@ def unattended_allowed(tool: str, tool_input: dict) -> tuple[bool, str]:
             return True, ""
         return False, f"Unattended edits are limited to {WORKDIR}"
     if tool == "Bash":
-        cmd = str(tool_input.get("command", ""))
-        if BASH_UNATTENDED_DENY.search(cmd):
+        if BASH_UNATTENDED_DENY.search(str(tool_input.get("command", ""))):
             return False, "Command not allowed in unattended mode (network, publish, privilege or destructive)"
         return True, ""
     if tool in NETWORK_TOOLS:
@@ -154,40 +160,42 @@ def _to_ddb(value: Any) -> Any:
     return value
 
 
-def get_task(task_id: str) -> dict | None:
-    return tasks_t.get_item(Key={"task_id": task_id}, ConsistentRead=True).get("Item")
+def get_session(sid: str) -> dict | None:
+    item = sessions_t.get_item(Key={"task_id": sid}, ConsistentRead=True).get("Item")
+    return item if item and item.get("kind") == KIND else None
 
 
-def update_task(task_id: str, **fields: Any) -> None:
-    names = {f"#{k}": k for k in fields}
-    values = {f":{k}": _to_ddb(v) for k, v in fields.items()}
-    tasks_t.update_item(
-        Key={"task_id": task_id},
+def set_fields(sid: str, **fields: Any) -> None:
+    sessions_t.update_item(
+        Key={"task_id": sid},
         UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in fields),
-        ExpressionAttributeNames=names,
-        ExpressionAttributeValues=values,
+        ExpressionAttributeNames={f"#{k}": k for k in fields},
+        ExpressionAttributeValues={f":{k}": _to_ddb(v) for k, v in fields.items()},
     )
 
 
-def recent_tasks(statuses: set[str]) -> list[dict]:
-    resp = tasks_t.query(
+def my_sessions(statuses: set[str], pending_only: bool = False) -> list[dict]:
+    flt = Attr("worker_id").eq(WORKER_ID) & Attr("status").is_in(sorted(statuses))
+    if pending_only:
+        flt = flt & Attr("pending_count").gt(0)
+    resp = sessions_t.query(
         IndexName="by_created",
-        KeyConditionExpression=Key("kind").eq("task"),
-        FilterExpression=Attr("worker_id").eq(WORKER_ID) & Attr("status").is_in(sorted(statuses)),
+        KeyConditionExpression=Key("kind").eq(KIND),
+        FilterExpression=flt,
         ScanIndexForward=False,
-        Limit=200,
+        Limit=300,
     )
-    return sorted(resp.get("Items", []), key=lambda i: i.get("created_at", ""))
+    return sorted(resp.get("Items", []), key=lambda i: i.get("updated_at", ""))
 
 
-def claim(task_id: str) -> bool:
+def claim_turn(sid: str) -> bool:
     try:
-        tasks_t.update_item(
-            Key={"task_id": task_id},
-            UpdateExpression="SET #s = :r, started_at = :t",
-            ConditionExpression="#s = :q AND worker_id = :w",
+        sessions_t.update_item(
+            Key={"task_id": sid},
+            UpdateExpression="SET #s = :r, interrupt_requested = :f",
+            ConditionExpression="#s = :idle AND pending_count > :zero AND worker_id = :w AND close_requested = :f",
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":r": "RUNNING", ":t": now_iso(), ":q": "QUEUED", ":w": WORKER_ID},
+            ExpressionAttributeValues={":r": "RUNNING", ":idle": "IDLE", ":zero": 0, ":w": WORKER_ID, ":f": False},
         )
         return True
     except ClientError as e:
@@ -196,22 +204,35 @@ def claim(task_id: str) -> bool:
         raise
 
 
-def heartbeat(current_task: str | None) -> None:
+def finish_turn(sid: str, status: str, cost: float | None) -> None:
+    expr = "SET #s = :s, updated_at = :t, interrupt_requested = :f, consumed = consumed + :one ADD pending_count :neg"
+    values: dict[str, Any] = {":s": status, ":t": now_iso(), ":f": False, ":one": 1, ":neg": -1}
+    if cost is not None:
+        expr = expr.replace(" ADD ", ", cost_usd = if_not_exists(cost_usd, :zero) + :c ADD ")
+        values[":c"] = Decimal(str(cost))
+        values[":zero"] = Decimal("0")
+    sessions_t.update_item(
+        Key={"task_id": sid}, UpdateExpression=expr,
+        ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues=values,
+    )
+
+
+def heartbeat(active: list[str]) -> None:
     workers_t.put_item(Item={
         "worker_id": WORKER_ID,
         "last_heartbeat": now_iso(),
         "last_heartbeat_epoch": Decimal(str(round(time.time(), 1))),
-        "current_task": current_task or "",
+        "live_sessions": active,
         "model": MODEL,
     })
 
 
 # ---------------------------------------------------------------------------
-# Event stream for one task
+# Event stream for one session
 # ---------------------------------------------------------------------------
-class TaskStream:
-    def __init__(self, task_id: str, start_seq: int) -> None:
-        self.task_id = task_id
+class EventStream:
+    def __init__(self, sid: str, start_seq: int) -> None:
+        self.sid = sid
         self.seq = start_seq
         self.lock = asyncio.Lock()
 
@@ -219,10 +240,7 @@ class TaskStream:
         async with self.lock:
             self.seq += 1
             item = {
-                "task_id": self.task_id,
-                "seq": self.seq,
-                "ts": now_iso(),
-                "type": type_,
+                "task_id": self.sid, "seq": self.seq, "ts": now_iso(), "type": type_,
                 "expires_at": int(time.time()) + EVENT_TTL_DAYS * 86400,
                 **{k: v for k, v in fields.items() if v is not None},
             }
@@ -236,11 +254,187 @@ class TaskStream:
                     item["input"] = {k: _clip(v, 4000) for k, v in item["input"].items()}
             seq = self.seq
             await asyncio.to_thread(events_t.put_item, Item=_to_ddb(item))
-            await asyncio.to_thread(update_task, self.task_id, last_seq=seq)
+            await asyncio.to_thread(set_fields, self.sid, last_seq=seq)
 
-    async def status(self, status: str, message: str | None = None, **task_fields: Any) -> None:
-        await asyncio.to_thread(update_task, self.task_id, status=status, **task_fields)
+    async def status(self, status: str, message: str | None = None) -> None:
+        await asyncio.to_thread(set_fields, self.sid, status=status, updated_at=now_iso())
         await self.emit("status", status=status, message=message)
+
+
+# ---------------------------------------------------------------------------
+# One live Claude Code conversation
+# ---------------------------------------------------------------------------
+class LiveSession:
+    def __init__(self, worker: "Worker", item: dict) -> None:
+        self.worker = worker
+        self.sid: str = item["task_id"]
+        self.mode: str = item.get("mode", "interactive")
+        self.claude_session_id: str | None = item.get("claude_session_id") or None
+        self.stream = EventStream(self.sid, int(item.get("last_seq") or 0))
+        self.client: ClaudeSDKClient | None = None
+        self.last_used = time.monotonic()
+
+    async def _can_use_tool(self, tool: str, tool_input: dict, _ctx: Any):
+        reason = hard_deny_reason(tool, tool_input)
+        if reason:
+            await self.stream.emit("error", message=f"Blocked {tool}: {reason}")
+            return PermissionResultDeny(message=reason, interrupt=False)
+        if tool in READ_ONLY_TOOLS:
+            return PermissionResultAllow(updated_input=tool_input)
+        if self.mode == "unattended":
+            ok, why = unattended_allowed(tool, tool_input)
+            if ok:
+                return PermissionResultAllow(updated_input=tool_input)
+            await self.stream.emit("error", message=f"Denied {tool}: {why}")
+            return PermissionResultDeny(message=why, interrupt=False)
+        return await self._ask_human(tool, tool_input)
+
+    async def _ask_human(self, tool: str, tool_input: dict):
+        approval_id = uuid.uuid4().hex[:12]
+        await self.stream.emit("approval_request", tool=tool, input=tool_input, approval_id=approval_id)
+        await self.stream.status("WAITING_APPROVAL", f"waiting for approval of {tool}")
+        deadline = time.monotonic() + APPROVAL_TIMEOUT_S
+        decision, by = "deny", "timeout"
+        while time.monotonic() < deadline:
+            item = await asyncio.to_thread(get_session, self.sid) or {}
+            d = (item.get("decisions") or {}).get(approval_id)
+            if d:
+                decision, by = d.get("decision", "deny"), d.get("by", "")
+                break
+            if item.get("interrupt_requested") or item.get("close_requested"):
+                decision, by = "deny", "interrupt"
+                break
+            await self.worker.wait_control(2)
+        await self.stream.emit("approval_decision", approval_id=approval_id, decision=decision, decided_by=by)
+        await self.stream.status("RUNNING", None)
+        if decision == "allow":
+            return PermissionResultAllow(updated_input=tool_input)
+        return PermissionResultDeny(message=f"Denied by {by}", interrupt=False)
+
+    async def ensure_client(self) -> ClaudeSDKClient:
+        if self.client is None:
+            options = ClaudeAgentOptions(
+                cwd=WORKDIR,
+                model=MODEL,
+                max_turns=MAX_TURNS,
+                resume=self.claude_session_id,
+                can_use_tool=self._can_use_tool,
+                include_partial_messages=True,
+            )
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            self.client = client
+            log.info("session %s: Claude Code %s", self.sid, "resumed" if self.claude_session_id else "started")
+        return self.client
+
+    async def release(self) -> None:
+        if self.client is not None:
+            try:
+                await self.client.disconnect()
+            except Exception as e:  # noqa: BLE001
+                log.warning("session %s: disconnect failed: %s", self.sid, e)
+            self.client = None
+            log.info("session %s: Claude Code released", self.sid)
+
+    async def run_turn(self, message: dict) -> tuple[str, float | None]:
+        """Run one user turn. Returns (status after the turn, cost)."""
+        self.last_used = time.monotonic()
+        await self.stream.emit("user_message", text=message.get("text", ""), by=message.get("by"))
+        await self.stream.status("RUNNING", None)
+
+        interrupted = False
+        cost: float | None = None
+        buf: list[str] = []
+        last_flush = time.monotonic()
+        streamed_text = False
+
+        async def flush() -> None:
+            nonlocal last_flush
+            if buf:
+                text = "".join(buf)
+                buf.clear()
+                await self.stream.emit("text", text=text, partial=True)
+            last_flush = time.monotonic()
+
+        try:
+            client = await self.ensure_client()
+
+            async def watch_interrupt() -> None:
+                nonlocal interrupted
+                while True:
+                    await self.worker.wait_control(1)
+                    item = await asyncio.to_thread(get_session, self.sid) or {}
+                    if item.get("interrupt_requested") or item.get("close_requested"):
+                        interrupted = True
+                        await self.stream.emit("status", status="RUNNING", message="interrupting…")
+                        await client.interrupt()
+                        return
+
+            watcher = asyncio.create_task(watch_interrupt())
+            try:
+                await client.query(message.get("text", ""))
+                async for msg in client.receive_response():
+                    kind = type(msg).__name__
+                    if kind == "StreamEvent":
+                        ev = getattr(msg, "event", {}) or {}
+                        delta = ev.get("delta") or {}
+                        if ev.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
+                            buf.append(delta.get("text", ""))
+                            streamed_text = True
+                            if time.monotonic() - last_flush >= FLUSH_SECONDS or sum(map(len, buf)) >= FLUSH_CHARS:
+                                await flush()
+                        elif ev.get("type") in ("content_block_stop", "message_stop"):
+                            await flush()
+                    elif kind == "SystemMessage":
+                        data = getattr(msg, "data", {}) or {}
+                        if getattr(msg, "subtype", "") == "init" and data.get("session_id"):
+                            if data["session_id"] != self.claude_session_id:
+                                self.claude_session_id = data["session_id"]
+                                await asyncio.to_thread(set_fields, self.sid,
+                                                        claude_session_id=self.claude_session_id)
+                    elif kind == "AssistantMessage":
+                        await flush()
+                        for block in getattr(msg, "content", []) or []:
+                            bkind = type(block).__name__
+                            if bkind == "TextBlock" and not streamed_text and getattr(block, "text", ""):
+                                await self.stream.emit("text", text=block.text)
+                            elif bkind == "ToolUseBlock":
+                                await self.stream.emit("tool_use", tool=block.name, input=block.input)
+                        streamed_text = False
+                    elif kind == "UserMessage":
+                        content = getattr(msg, "content", [])
+                        for block in content if isinstance(content, list) else []:
+                            if type(block).__name__ == "ToolResultBlock":
+                                out = block.content
+                                if isinstance(out, list):
+                                    out = "\n".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in out)
+                                await self.stream.emit("tool_result", output=str(out or ""),
+                                                       is_error=bool(getattr(block, "is_error", False)))
+                    elif kind == "ResultMessage":
+                        await flush()
+                        cost = getattr(msg, "total_cost_usd", None)
+                        sid = getattr(msg, "session_id", None)
+                        if sid and sid != self.claude_session_id:
+                            self.claude_session_id = sid
+                            await asyncio.to_thread(set_fields, self.sid, claude_session_id=sid)
+                        await self.stream.emit(
+                            "turn_end",
+                            is_error=bool(getattr(msg, "is_error", False)),
+                            message="interrupted" if interrupted else getattr(msg, "subtype", None),
+                            cost_usd=float(cost) if cost is not None else None,
+                            num_turns=getattr(msg, "num_turns", None),
+                        )
+            finally:
+                watcher.cancel()
+                await flush()
+        except Exception as e:  # noqa: BLE001 - report and drop the client; next turn resumes
+            log.exception("session %s: turn failed", self.sid)
+            await self.stream.emit("error", message=f"{type(e).__name__}: {e}")
+            await self.release()
+
+        self.last_used = time.monotonic()
+        item = await asyncio.to_thread(get_session, self.sid) or {}
+        return ("CLOSED" if item.get("close_requested") else "IDLE"), cost
 
 
 # ---------------------------------------------------------------------------
@@ -251,11 +445,11 @@ class Worker:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.wake = asyncio.Event()
         self.control = asyncio.Event()
-        self.current_task: str | None = None
+        self.live: dict[str, LiveSession] = {}
         self.stopping = False
         self.mqtt = None
 
-    # ---- IoT (wake-up channel) --------------------------------------------
+    # ---- IoT wake-ups -------------------------------------------------------
     def _on_publish(self, data: Any) -> None:
         topic = getattr(data.publish_packet, "topic", "")
         assert self.loop is not None
@@ -263,10 +457,11 @@ class Worker:
             self.loop.call_soon_threadsafe(self.wake.set)
         elif topic == TOPIC_CONTROL:
             self.loop.call_soon_threadsafe(self.control.set)
+            self.loop.call_soon_threadsafe(self.wake.set)
 
     def start_mqtt(self) -> None:
         if not IOT_ENDPOINT:
-            log.warning("IOT_ENDPOINT not set; running in polling-only mode")
+            log.warning("IOT_ENDPOINT not set; polling-only mode")
             return
         try:
             from awscrt import auth, mqtt5
@@ -286,33 +481,52 @@ class Worker:
             ])).result(30)
             self.mqtt = client
             log.info("Subscribed to %s and %s", TOPIC_TASKS, TOPIC_CONTROL)
-        except Exception as e:  # noqa: BLE001 - polling keeps the worker functional
-            log.warning("MQTT unavailable (%s); falling back to polling every %ss", e, POLL_SECONDS)
+        except Exception as e:  # noqa: BLE001
+            log.warning("MQTT unavailable (%s); polling every %ss", e, POLL_SECONDS)
 
-    async def _wait_control(self, seconds: float) -> None:
+    async def wait_control(self, seconds: float) -> None:
         self.control.clear()
         try:
             await asyncio.wait_for(self.control.wait(), timeout=seconds)
         except asyncio.TimeoutError:
             pass
 
-    # ---- lifecycle ------------------------------------------------------------
+    # ---- housekeeping ---------------------------------------------------------
     async def heartbeat_loop(self) -> None:
         while not self.stopping:
             try:
-                await asyncio.to_thread(heartbeat, self.current_task)
+                await asyncio.to_thread(heartbeat, list(self.live))
             except Exception as e:  # noqa: BLE001
                 log.warning("heartbeat failed: %s", e)
             await asyncio.sleep(HEARTBEAT_SECONDS)
 
     async def recover_orphans(self) -> None:
-        """Tasks left RUNNING by a previous process cannot be resumed mid-turn."""
-        for item in await asyncio.to_thread(recent_tasks, {"RUNNING", "WAITING_APPROVAL"}):
-            stream = TaskStream(item["task_id"], int(item.get("last_seq") or 0))
-            await stream.emit("error", message="Worker restarted while this task was running")
-            await stream.status("FAILED", "worker restarted", finished_at=now_iso(),
-                                result_summary="Worker restarted; submit a follow-up to continue")
+        """A turn cut off by a restart is reported and skipped (not re-run)."""
+        for item in await asyncio.to_thread(my_sessions, {"RUNNING", "WAITING_APPROVAL"}):
+            stream = EventStream(item["task_id"], int(item.get("last_seq") or 0))
+            await stream.emit("error", message="Worker restarted during this turn; it was stopped. "
+                                               "Send a message to continue the conversation.")
+            await asyncio.to_thread(finish_turn, item["task_id"], "IDLE", None)
+            await stream.emit("status", status="IDLE", message=None)
 
+    async def release_idle(self) -> None:
+        now = time.monotonic()
+        closed = {i["task_id"] for i in await asyncio.to_thread(my_sessions, {"CLOSED", "FAILED"})}
+        for sid, live in list(self.live.items()):
+            if sid in closed or now - live.last_used > IDLE_RELEASE_SECONDS:
+                await live.release()
+                del self.live[sid]
+        while len(self.live) > MAX_LIVE_SESSIONS:
+            sid, live = min(self.live.items(), key=lambda kv: kv[1].last_used)
+            await live.release()
+            del self.live[sid]
+
+    async def close_requested_idle(self) -> None:
+        for item in await asyncio.to_thread(my_sessions, {"IDLE"}):
+            if item.get("close_requested"):
+                await asyncio.to_thread(set_fields, item["task_id"], status="CLOSED", updated_at=now_iso())
+
+    # ---- main loop ------------------------------------------------------------
     async def run(self) -> None:
         self.loop = asyncio.get_running_loop()
         os.makedirs(WORKDIR, exist_ok=True)
@@ -322,13 +536,14 @@ class Worker:
         log.info("Worker %s ready (workdir=%s, model=%s)", WORKER_ID, WORKDIR, MODEL)
         try:
             while not self.stopping:
-                queued = await asyncio.to_thread(recent_tasks, {"QUEUED"})
                 ran = False
-                for item in queued:
-                    if await asyncio.to_thread(claim, item["task_id"]):
-                        await self.run_task(item["task_id"])
+                for item in await asyncio.to_thread(my_sessions, {"IDLE"}, True):
+                    if await asyncio.to_thread(claim_turn, item["task_id"]):
+                        await self.run_one_turn(item["task_id"])
                         ran = True
                         break
+                await self.close_requested_idle()
+                await self.release_idle()
                 if ran:
                     continue
                 self.wake.clear()
@@ -338,139 +553,30 @@ class Worker:
                     pass
         finally:
             hb.cancel()
+            for live in self.live.values():
+                await live.release()
             if self.mqtt is not None:
                 self.mqtt.stop()
 
-    # ---- one task -------------------------------------------------------------
-    async def run_task(self, task_id: str) -> None:
-        task = await asyncio.to_thread(get_task, task_id)
-        if not task:
+    async def run_one_turn(self, sid: str) -> None:
+        item = await asyncio.to_thread(get_session, sid)
+        if not item:
             return
-        self.current_task = task_id
-        stream = TaskStream(task_id, int(task.get("last_seq") or 0))
-        mode = task.get("mode", "interactive")
-        cancelled = False
-        await stream.status("RUNNING", f"started on {WORKER_ID} ({mode})")
-
-        resume = None
-        if task.get("parent_task_id"):
-            parent = await asyncio.to_thread(get_task, task["parent_task_id"])
-            resume = (parent or {}).get("claude_session_id") or None
-
-        async def can_use_tool(tool: str, tool_input: dict, _ctx: Any):
-            reason = hard_deny_reason(tool, tool_input)
-            if reason:
-                await stream.emit("error", message=f"Blocked {tool}: {reason}")
-                return PermissionResultDeny(message=reason, interrupt=False)
-            if tool in READ_ONLY_TOOLS:
-                return PermissionResultAllow(updated_input=tool_input)
-            if mode == "unattended":
-                ok, why = unattended_allowed(tool, tool_input)
-                if ok:
-                    return PermissionResultAllow(updated_input=tool_input)
-                await stream.emit("error", message=f"Denied {tool}: {why}")
-                return PermissionResultDeny(message=why, interrupt=False)
-            return await self.ask_human(stream, tool, tool_input)
-
-        options = ClaudeAgentOptions(
-            cwd=WORKDIR,
-            model=MODEL,
-            max_turns=MAX_TURNS,
-            resume=resume,
-            can_use_tool=can_use_tool,
-        )
-
-        result_text = ""
-        is_error = False
-        session_id = resume
-        cost = None
-        try:
-            async with ClaudeSDKClient(options=options) as client:
-
-                async def watch_cancel() -> None:
-                    nonlocal cancelled
-                    while True:
-                        await self._wait_control(2)
-                        t = await asyncio.to_thread(get_task, task_id)
-                        if t and t.get("cancel_requested"):
-                            cancelled = True
-                            await stream.emit("status", status="RUNNING", message="cancel requested; stopping")
-                            await client.interrupt()
-                            return
-
-                watcher = asyncio.create_task(watch_cancel())
-                try:
-                    await client.query(task["prompt"])
-                    async for msg in client.receive_response():
-                        kind = type(msg).__name__
-                        if kind == "SystemMessage":
-                            data = getattr(msg, "data", {}) or {}
-                            if getattr(msg, "subtype", "") == "init" and data.get("session_id"):
-                                session_id = data["session_id"]
-                                await asyncio.to_thread(update_task, task_id, claude_session_id=session_id)
-                        elif kind == "AssistantMessage":
-                            for block in getattr(msg, "content", []) or []:
-                                bkind = type(block).__name__
-                                if bkind == "TextBlock" and getattr(block, "text", ""):
-                                    await stream.emit("text", text=block.text)
-                                elif bkind == "ToolUseBlock":
-                                    await stream.emit("tool_use", tool=block.name, input=block.input)
-                        elif kind == "UserMessage":
-                            content = getattr(msg, "content", [])
-                            for block in content if isinstance(content, list) else []:
-                                if type(block).__name__ == "ToolResultBlock":
-                                    out = block.content
-                                    if isinstance(out, list):
-                                        out = "\n".join(
-                                            c.get("text", "") if isinstance(c, dict) else str(c) for c in out)
-                                    await stream.emit("tool_result", output=str(out or ""),
-                                                      is_error=bool(getattr(block, "is_error", False)))
-                        elif kind == "ResultMessage":
-                            result_text = getattr(msg, "result", "") or ""
-                            is_error = bool(getattr(msg, "is_error", False))
-                            session_id = getattr(msg, "session_id", None) or session_id
-                            cost = getattr(msg, "total_cost_usd", None)
-                finally:
-                    watcher.cancel()
-        except Exception as e:  # noqa: BLE001 - report every failure on the task
-            log.exception("task %s failed", task_id)
-            is_error = True
-            result_text = f"{type(e).__name__}: {e}"
-            await stream.emit("error", message=result_text)
-
-        final = "CANCELLED" if cancelled else ("FAILED" if is_error else "SUCCEEDED")
-        if result_text:
-            await stream.emit("result", text=result_text)
-        fields: dict[str, Any] = {"finished_at": now_iso(), "result_summary": _clip(result_text, 2000)}
-        if session_id:
-            fields["claude_session_id"] = session_id
-        if cost is not None:
-            fields["cost_usd"] = float(cost)
-        await stream.status(final, None, **fields)
-        self.current_task = None
-        log.info("task %s finished: %s", task_id, final)
-
-    async def ask_human(self, stream: TaskStream, tool: str, tool_input: dict):
-        approval_id = uuid.uuid4().hex[:12]
-        await stream.emit("approval_request", tool=tool, input=tool_input, approval_id=approval_id)
-        await stream.status("WAITING_APPROVAL", f"waiting for approval of {tool}")
-        deadline = time.monotonic() + APPROVAL_TIMEOUT_S
-        decision, by = "deny", "timeout"
-        while time.monotonic() < deadline:
-            t = await asyncio.to_thread(get_task, stream.task_id)
-            d = ((t or {}).get("decisions") or {}).get(approval_id)
-            if d:
-                decision, by = d.get("decision", "deny"), d.get("by", "")
-                break
-            if (t or {}).get("cancel_requested"):
-                decision, by = "deny", "cancel"
-                break
-            await self._wait_control(2)
-        await stream.emit("approval_decision", approval_id=approval_id, decision=decision, decided_by=by)
-        await stream.status("RUNNING", None)
-        if decision == "allow":
-            return PermissionResultAllow(updated_input=tool_input)
-        return PermissionResultDeny(message=f"Denied by {by}", interrupt=False)
+        live = self.live.get(sid)
+        if live is None:
+            live = LiveSession(self, item)
+            self.live[sid] = live
+        inbox = item.get("inbox") or []
+        consumed = int(item.get("consumed") or 0)
+        if consumed >= len(inbox):
+            await asyncio.to_thread(set_fields, sid, status="IDLE", pending_count=0)
+            return
+        status, cost = await live.run_turn(inbox[consumed])
+        await asyncio.to_thread(finish_turn, sid, status, cost)
+        await live.stream.emit("status", status=status, message=None)
+        if status == "CLOSED":
+            await live.release()
+            self.live.pop(sid, None)
 
 
 def main() -> None:

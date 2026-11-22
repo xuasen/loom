@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Ban, Check, Loader2, Play, RefreshCw, SquareTerminal, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle, Check, Loader2, Plus, RefreshCw, Send, Square, SquareTerminal, X, XCircle,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -7,38 +9,49 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { ApiError } from "@/api/client";
 import {
-  TERMINAL_STATUSES,
-  cancelClaudeTask,
-  createClaudeTask,
+  CLOSED_STATUSES,
+  closeClaudeSession,
+  createClaudeSession,
   decideClaudeApproval,
   getClaudeConfig,
   getClaudeEvents,
-  getClaudeTask,
-  listClaudeTasks,
+  getClaudeSession,
+  interruptClaudeSession,
+  listClaudeSessions,
+  sendClaudeMessage,
   streamClaudeEvents,
   type ClaudeConfig,
   type ClaudeEvent,
-  type ClaudeTask,
-  type ClaudeTaskMode,
-  type ClaudeTaskStatus,
+  type ClaudeSession,
+  type ClaudeSessionMode,
+  type ClaudeSessionStatus,
 } from "@/api/claude";
 
 const POLL_INTERVAL_MS = 2000;
+const RECONNECT_DELAY_MS = 600;
 
-function statusVariant(status: ClaudeTaskStatus): "success" | "warning" | "destructive" | "neutral" | "secondary" {
+function statusVariant(status: ClaudeSessionStatus): "success" | "warning" | "destructive" | "neutral" | "secondary" {
   switch (status) {
-    case "SUCCEEDED":
+    case "IDLE":
       return "success";
     case "WAITING_APPROVAL":
       return "warning";
     case "FAILED":
       return "destructive";
-    case "CANCELLED":
+    case "CLOSED":
       return "neutral";
     default:
       return "secondary";
   }
 }
+
+const STATUS_LABEL: Record<ClaudeSessionStatus, string> = {
+  IDLE: "ready",
+  RUNNING: "working",
+  WAITING_APPROVAL: "needs approval",
+  CLOSED: "ended",
+  FAILED: "failed",
+};
 
 function shortJson(value: unknown, max = 400): string {
   let text: string;
@@ -50,11 +63,14 @@ function shortJson(value: unknown, max = 400): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-/** History first, then live stream; events are merged and de-duplicated by seq. */
-function useTaskEvents(taskId: string | null) {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** History first, then the live stream (reconnecting); events de-duplicated by seq. */
+function useSessionEvents(sessionId: string | null) {
   const [events, setEvents] = useState<ClaudeEvent[]>([]);
-  const [status, setStatus] = useState<ClaudeTaskStatus | null>(null);
-  const [live, setLive] = useState(false);
+  const [status, setStatus] = useState<ClaudeSessionStatus | null>(null);
+  const [pending, setPending] = useState(0);
+  const [connected, setConnected] = useState(false);
   const lastSeqRef = useRef(0);
 
   const merge = useCallback((incoming: ClaudeEvent[]) => {
@@ -63,64 +79,95 @@ function useTaskEvents(taskId: string | null) {
     const last = fresh[fresh.length - 1];
     if (last) lastSeqRef.current = last.seq;
     setEvents((prev) => [...prev, ...fresh]);
-    for (const e of fresh) {
-      if (e.type === "status" && e.status) setStatus(e.status);
-    }
+    for (const e of fresh) if (e.type === "status" && e.status) setStatus(e.status);
   }, []);
 
   useEffect(() => {
     setEvents([]);
     setStatus(null);
-    setLive(false);
+    setPending(0);
+    setConnected(false);
     lastSeqRef.current = 0;
-    if (!taskId) return;
+    if (!sessionId) return;
 
     const controller = new AbortController();
-    let pollTimer: ReturnType<typeof setTimeout> | null = null;
-    let stopped = false;
+    const { signal } = controller;
 
-    const poll = async () => {
-      if (stopped) return;
-      try {
-        const page = await getClaudeEvents(taskId, lastSeqRef.current);
-        merge(page.events);
-        setStatus(page.task_status);
-        if (TERMINAL_STATUSES.has(page.task_status)) {
-          setLive(false);
-          return;
-        }
-      } catch {
-        // transient; keep polling
-      }
-      pollTimer = setTimeout(poll, POLL_INTERVAL_MS);
+    const catchUp = async (): Promise<ClaudeSessionStatus | null> => {
+      const page = await getClaudeEvents(sessionId, lastSeqRef.current);
+      merge(page.events);
+      setStatus(page.status);
+      setPending(page.pending_count);
+      return page.status;
     };
 
     (async () => {
+      let st: ClaudeSessionStatus | null = null;
       try {
-        const history = await getClaudeEvents(taskId, 0);
-        if (stopped) return;
-        merge(history.events);
-        setStatus(history.task_status);
-        if (TERMINAL_STATUSES.has(history.task_status)) return;
-        setLive(true);
-        await streamClaudeEvents(taskId, lastSeqRef.current, (e) => merge([e]), controller.signal);
-        // Stream ended (task finished or server closed it): reconcile once.
-        await poll();
+        st = await catchUp();
       } catch {
-        if (stopped || controller.signal.aborted) return;
-        setLive(true);
-        void poll(); // streaming unavailable: fall back to incremental polling
+        /* retried below */
+      }
+      while (!signal.aborted) {
+        if (st && CLOSED_STATUSES.has(st)) {
+          setConnected(false);
+          return;
+        }
+        try {
+          setConnected(true);
+          await streamClaudeEvents(
+            sessionId,
+            lastSeqRef.current,
+            (e) => merge([e]),
+            (s) => {
+              st = s.status;
+              setStatus(s.status);
+              setPending(s.pending_count);
+            },
+            signal,
+          );
+          await sleep(RECONNECT_DELAY_MS); // server ends streams periodically; resume from last seq
+        } catch {
+          if (signal.aborted) return;
+          setConnected(false);
+          await sleep(POLL_INTERVAL_MS);
+          try {
+            st = await catchUp();
+          } catch {
+            /* keep retrying */
+          }
+        }
       }
     })();
 
-    return () => {
-      stopped = true;
-      controller.abort();
-      if (pollTimer) clearTimeout(pollTimer);
-    };
-  }, [taskId, merge]);
+    return () => controller.abort();
+  }, [sessionId, merge]);
 
-  return { events, status, live };
+  return { events, status, pending, connected };
+}
+
+type Block =
+  | { kind: "user"; key: number; text: string; by?: string }
+  | { kind: "assistant"; key: number; text: string }
+  | { kind: "event"; key: number; event: ClaudeEvent };
+
+/** Merge consecutive streamed text chunks into one assistant block. */
+function toBlocks(events: ClaudeEvent[]): Block[] {
+  const blocks: Block[] = [];
+  for (const e of events) {
+    if (e.type === "text") {
+      const prev = blocks[blocks.length - 1];
+      if (prev && prev.kind === "assistant") prev.text += e.text ?? "";
+      else blocks.push({ kind: "assistant", key: e.seq, text: e.text ?? "" });
+    } else if (e.type === "user_message") {
+      blocks.push({ kind: "user", key: e.seq, text: e.text ?? "", by: e.by });
+    } else if (e.type === "status" && !e.message) {
+      // plain state changes are shown in the header, not the transcript
+    } else {
+      blocks.push({ kind: "event", key: e.seq, event: e });
+    }
+  }
+  return blocks;
 }
 
 function EventRow({
@@ -133,19 +180,17 @@ function EventRow({
   onDecide: (approvalId: string, decision: "allow" | "deny") => void;
 }) {
   switch (event.type) {
-    case "text":
-      return <div className="whitespace-pre-wrap text-sm leading-relaxed">{event.text}</div>;
     case "tool_use":
       return (
         <div className="font-mono text-xs text-muted-foreground">
-          <span className="text-foreground">▶ {event.tool}</span> {shortJson(event.input)}
+          <span className="text-foreground">● {event.tool}</span> {shortJson(event.input)}
         </div>
       );
     case "tool_result":
       return (
-        <details className="font-mono text-xs">
+        <details className="font-mono text-xs pl-3">
           <summary className={event.is_error ? "text-destructive cursor-pointer" : "text-muted-foreground cursor-pointer"}>
-            {event.is_error ? "✗ tool error" : "✓ tool result"} ({(event.output ?? "").length} chars)
+            {event.is_error ? "⎿ error" : "⎿ result"} ({(event.output ?? "").length} chars)
           </summary>
           <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap rounded border bg-muted/40 p-2">{event.output}</pre>
         </details>
@@ -154,7 +199,7 @@ function EventRow({
       return (
         <div className="rounded-md border border-warning/50 bg-warning-bg p-3 text-sm space-y-2">
           <div className="flex items-center gap-2 font-medium">
-            <AlertTriangle className="h-4 w-4 text-warning" /> Approval needed: {event.tool}
+            <AlertTriangle className="h-4 w-4 text-warning" /> Allow {event.tool}?
           </div>
           <pre className="max-h-48 overflow-auto whitespace-pre-wrap font-mono text-xs">{shortJson(event.input, 2000)}</pre>
           {canDecide && event.approval_id && (
@@ -177,21 +222,16 @@ function EventRow({
         </div>
       );
     case "status":
+      return <div className="text-xs text-muted-foreground">{event.message}</div>;
+    case "turn_end":
       return (
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          {event.status && <Badge variant={statusVariant(event.status)}>{event.status}</Badge>}
-          {event.message}
+        <div className="text-[10px] text-muted-foreground/70">
+          {event.message === "interrupted" ? "interrupted" : event.is_error ? "turn ended with an error" : "done"}
+          {typeof event.cost_usd === "number" ? ` · $${event.cost_usd.toFixed(4)}` : ""}
         </div>
       );
     case "error":
       return <div className="whitespace-pre-wrap text-sm text-destructive">{event.message ?? event.text}</div>;
-    case "result":
-      return (
-        <div className="rounded-md border bg-muted/30 p-3 whitespace-pre-wrap text-sm">
-          <div className="mb-1 text-xs font-medium text-muted-foreground">Result</div>
-          {event.text ?? event.message}
-        </div>
-      );
     default:
       return null;
   }
@@ -200,27 +240,30 @@ function EventRow({
 export function ClaudeTerminalPage() {
   const [config, setConfig] = useState<ClaudeConfig | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
-  const [tasks, setTasks] = useState<ClaudeTask[]>([]);
+  const [sessions, setSessions] = useState<ClaudeSession[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [selectedTask, setSelectedTask] = useState<ClaudeTask | null>(null);
-  const [prompt, setPrompt] = useState("");
-  const [mode, setMode] = useState<ClaudeTaskMode>("interactive");
-  const [submitting, setSubmitting] = useState(false);
-  const [followUp, setFollowUp] = useState("");
+  const [selected, setSelected] = useState<ClaudeSession | null>(null);
+  const [input, setInput] = useState("");
+  const [mode, setMode] = useState<ClaudeSessionMode>("interactive");
+  const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const stickToBottomRef = useRef(true);
+  const stickRef = useRef(true);
 
-  const { events, status, live } = useTaskEvents(selectedId);
-  const effectiveStatus: ClaudeTaskStatus | null = status ?? selectedTask?.status ?? null;
-  const isFinished = effectiveStatus !== null && TERMINAL_STATUSES.has(effectiveStatus);
-  const decidedIds = new Set(events.filter((e) => e.type === "approval_decision").map((e) => e.approval_id));
+  const { events, status, pending, connected } = useSessionEvents(selectedId);
+  const blocks = useMemo(() => toBlocks(events), [events]);
+  const effectiveStatus: ClaudeSessionStatus | null = status ?? selected?.status ?? null;
+  const isClosed = effectiveStatus !== null && CLOSED_STATUSES.has(effectiveStatus);
+  const isBusy = effectiveStatus === "RUNNING" || effectiveStatus === "WAITING_APPROVAL";
+  const decided = useMemo(
+    () => new Set(events.filter((e) => e.type === "approval_decision").map((e) => e.approval_id)),
+    [events],
+  );
 
-  const refreshTasks = useCallback(async () => {
+  const refreshSessions = useCallback(async () => {
     try {
-      const res = await listClaudeTasks();
-      setTasks(res.tasks);
+      setSessions((await listClaudeSessions()).sessions);
     } catch (e) {
-      toast.error(`Could not load tasks: ${(e as Error).message}`);
+      toast.error(`Could not load sessions: ${(e as Error).message}`);
     }
   }, []);
 
@@ -228,51 +271,80 @@ export function ClaudeTerminalPage() {
     getClaudeConfig()
       .then((cfg) => {
         setConfig(cfg);
-        if (cfg.enabled) void refreshTasks();
+        if (cfg.enabled) void refreshSessions();
       })
       .catch((e: unknown) => {
         setConfigError(
           e instanceof ApiError && e.status === 404
-            ? "The Claude worker backend is not deployed yet."
+            ? "The Claude worker backend is not configured."
             : (e as Error).message,
         );
       });
-  }, [refreshTasks]);
+  }, [refreshSessions]);
 
   useEffect(() => {
     if (!selectedId) {
-      setSelectedTask(null);
+      setSelected(null);
       return;
     }
-    getClaudeTask(selectedId).then(setSelectedTask).catch(() => setSelectedTask(null));
+    getClaudeSession(selectedId).then(setSelected).catch(() => setSelected(null));
   }, [selectedId]);
 
-  // Keep the list's status badges current while something is still running.
+  // Keep list badges fresh while any session is active.
   useEffect(() => {
-    if (!tasks.some((t) => !TERMINAL_STATUSES.has(t.status))) return;
-    const id = setInterval(() => void refreshTasks(), 10000);
+    if (!sessions.some((s) => s.status === "RUNNING" || s.status === "WAITING_APPROVAL")) return;
+    const id = setInterval(() => void refreshSessions(), 10000);
     return () => clearInterval(id);
-  }, [tasks, refreshTasks]);
+  }, [sessions, refreshSessions]);
+
+  useEffect(() => {
+    if (status && selectedId) {
+      setSessions((prev) => prev.map((s) => (s.session_id === selectedId ? { ...s, status } : s)));
+    }
+  }, [status, selectedId]);
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
-  }, [events]);
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  }, [blocks]);
 
-  const submit = async (text: string, parentTaskId?: string) => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    setSubmitting(true);
+  const send = async () => {
+    const text = input.trim();
+    if (!text || sending) return;
+    setSending(true);
     try {
-      const task = await createClaudeTask({ prompt: trimmed, mode, parent_task_id: parentTaskId });
-      setTasks((prev) => [task, ...prev.filter((t) => t.task_id !== task.task_id)]);
-      setSelectedId(task.task_id);
-      setPrompt("");
-      setFollowUp("");
+      if (!selectedId) {
+        const s = await createClaudeSession({ message: text, mode });
+        setSessions((prev) => [s, ...prev]);
+        setSelectedId(s.session_id);
+      } else {
+        await sendClaudeMessage(selectedId, text);
+      }
+      setInput("");
+      stickRef.current = true;
     } catch (e) {
-      toast.error(`Could not submit task: ${(e as Error).message}`);
+      toast.error(`Could not send: ${(e as Error).message}`);
     } finally {
-      setSubmitting(false);
+      setSending(false);
+    }
+  };
+
+  const interrupt = useCallback(async () => {
+    if (!selectedId) return;
+    try {
+      await interruptClaudeSession(selectedId);
+    } catch (e) {
+      toast.error(`Could not interrupt: ${(e as Error).message}`);
+    }
+  }, [selectedId]);
+
+  const endSession = async () => {
+    if (!selectedId) return;
+    try {
+      await closeClaudeSession(selectedId);
+      void refreshSessions();
+    } catch (e) {
+      toast.error(`Could not end session: ${(e as Error).message}`);
     }
   };
 
@@ -285,15 +357,17 @@ export function ClaudeTerminalPage() {
     }
   };
 
-  const cancel = async () => {
-    if (!selectedId) return;
-    try {
-      await cancelClaudeTask(selectedId);
-      toast.success("Cancel requested");
-    } catch (e) {
-      toast.error(`Could not cancel: ${(e as Error).message}`);
-    }
-  };
+  // Esc interrupts the running turn, like in the terminal.
+  useEffect(() => {
+    if (!isBusy) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") void interrupt();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isBusy, interrupt]);
+
+  const worker = config?.workers[0];
 
   return (
     <div className="space-y-4">
@@ -303,18 +377,14 @@ export function ClaudeTerminalPage() {
             <SquareTerminal className="h-6 w-6" /> Claude Terminal
           </h2>
           <p className="text-sm text-muted-foreground">
-            Send tasks to Claude Code on a private worker. Tasks keep running after you sign out; every step is
-            recorded and can be replayed.
+            Conversations with Claude Code on a private worker. A session keeps its context across messages,
+            keeps working after you sign out, and can be replayed.
           </p>
         </div>
-        {config?.enabled && (
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            {config.workers.map((w) => (
-              <Badge key={w.worker_id} variant={w.online ? "success" : "neutral"}>
-                {w.worker_id} {w.online ? "online" : "offline"}
-              </Badge>
-            ))}
-          </div>
+        {config?.enabled && worker && (
+          <Badge variant={worker.online ? "success" : "neutral"}>
+            {worker.worker_id} {worker.online ? "online" : "offline"}
+          </Badge>
         )}
       </div>
 
@@ -330,147 +400,162 @@ export function ClaudeTerminalPage() {
           <Loader2 className="h-4 w-4 animate-spin" /> Loading…
         </div>
       )}
-      {config && !config.enabled && (
-        <Card>
-          <CardContent className="py-6 text-sm text-muted-foreground">No Claude worker is configured.</CardContent>
-        </Card>
-      )}
 
       {config?.enabled && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[320px_1fr]">
-          <div className="space-y-4">
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm">New task</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <Textarea
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  placeholder="Describe what Claude Code should do…"
-                  rows={5}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void submit(prompt);
-                  }}
-                />
-                <div className="flex items-center gap-3 text-xs">
-                  <label className="flex items-center gap-1">
-                    <input type="radio" checked={mode === "interactive"} onChange={() => setMode("interactive")} />
-                    Ask before risky steps
-                  </label>
-                  <label className="flex items-center gap-1">
-                    <input type="radio" checked={mode === "unattended"} onChange={() => setMode("unattended")} />
-                    Unattended (allowlist only)
-                  </label>
-                </div>
-                <Button className="w-full" disabled={submitting || !prompt.trim()} onClick={() => void submit(prompt)}>
-                  {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />} Run
-                </Button>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader className="pb-2 flex flex-row items-center justify-between">
-                <CardTitle className="text-sm">Tasks</CardTitle>
-                <Button size="icon-xs" variant="ghost" onClick={() => void refreshTasks()} title="Refresh">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[280px_1fr]">
+          <Card className="h-fit">
+            <CardHeader className="pb-2 flex flex-row items-center justify-between">
+              <CardTitle className="text-sm">Sessions</CardTitle>
+              <div className="flex gap-1">
+                <Button size="icon-xs" variant="ghost" onClick={() => void refreshSessions()} title="Refresh">
                   <RefreshCw />
                 </Button>
-              </CardHeader>
-              <CardContent className="p-2 space-y-1 max-h-[55vh] overflow-y-auto">
-                {tasks.length === 0 && <div className="px-2 py-4 text-xs text-muted-foreground">No tasks yet.</div>}
-                {tasks.map((t) => (
-                  <button
-                    key={t.task_id}
-                    type="button"
-                    onClick={() => setSelectedId(t.task_id)}
-                    className={`w-full rounded-md px-2 py-2 text-left text-xs transition-colors ${
-                      t.task_id === selectedId ? "bg-accent" : "hover:bg-accent/50"
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate font-medium">{t.prompt}</span>
-                      <Badge variant={statusVariant(t.status)}>{t.status}</Badge>
-                    </div>
-                    <div className="mt-0.5 text-muted-foreground">
-                      {new Date(t.created_at).toLocaleString()} · {t.submitted_by}
-                    </div>
-                  </button>
-                ))}
-              </CardContent>
-            </Card>
-          </div>
-
-          <Card className="min-h-[60vh] flex flex-col">
-            {!selectedId ? (
-              <CardContent className="flex-1 flex items-center justify-center text-sm text-muted-foreground">
-                Select a task or run a new one.
-              </CardContent>
-            ) : (
-              <>
-                <CardHeader className="pb-2 flex flex-row items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <CardTitle className="text-sm truncate">{selectedTask?.prompt ?? selectedId}</CardTitle>
-                    <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
-                      {effectiveStatus && <Badge variant={statusVariant(effectiveStatus)}>{effectiveStatus}</Badge>}
-                      {live && !isFinished && (
-                        <span className="flex items-center gap-1">
-                          <span className="h-2 w-2 rounded-full bg-success animate-pulse" /> live
-                        </span>
-                      )}
-                      <span className="font-mono">{selectedId}</span>
-                    </div>
+                <Button size="icon-xs" variant="ghost" onClick={() => setSelectedId(null)} title="New session">
+                  <Plus />
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent className="p-2 space-y-1 max-h-[70vh] overflow-y-auto">
+              {sessions.length === 0 && <div className="px-2 py-4 text-xs text-muted-foreground">No sessions yet.</div>}
+              {sessions.map((s) => (
+                <button
+                  key={s.session_id}
+                  type="button"
+                  onClick={() => setSelectedId(s.session_id)}
+                  className={`w-full rounded-md px-2 py-2 text-left text-xs transition-colors ${
+                    s.session_id === selectedId ? "bg-accent" : "hover:bg-accent/50"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate font-medium">{s.title}</span>
+                    <Badge variant={statusVariant(s.status)}>{STATUS_LABEL[s.status]}</Badge>
                   </div>
-                  {!isFinished && (
-                    <Button size="sm" variant="outline" onClick={() => void cancel()}>
-                      <Ban className="h-3.5 w-3.5" /> Cancel
+                  <div className="mt-0.5 text-muted-foreground">
+                    {new Date(s.updated_at ?? s.created_at).toLocaleString()} · {s.turns} turns
+                  </div>
+                </button>
+              ))}
+            </CardContent>
+          </Card>
+
+          <Card className="flex flex-col min-h-[70vh]">
+            <CardHeader className="pb-2 flex flex-row items-center justify-between gap-2">
+              <div className="min-w-0">
+                <CardTitle className="text-sm truncate">
+                  {selectedId ? selected?.title ?? selectedId : "New session"}
+                </CardTitle>
+                {selectedId && (
+                  <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+                    {effectiveStatus && (
+                      <Badge variant={statusVariant(effectiveStatus)}>{STATUS_LABEL[effectiveStatus]}</Badge>
+                    )}
+                    {pending > 0 && isBusy && <span>{pending - 1 > 0 ? `${pending - 1} queued` : ""}</span>}
+                    {connected && !isClosed && (
+                      <span className="flex items-center gap-1">
+                        <span className="h-2 w-2 rounded-full bg-success animate-pulse" /> live
+                      </span>
+                    )}
+                    {selected && <span>{selected.mode}</span>}
+                  </div>
+                )}
+              </div>
+              {selectedId && !isClosed && (
+                <div className="flex gap-2">
+                  {isBusy && (
+                    <Button size="sm" variant="outline" onClick={() => void interrupt()} title="Esc">
+                      <Square className="h-3.5 w-3.5" /> Interrupt
                     </Button>
                   )}
-                </CardHeader>
-                <CardContent className="flex-1 flex flex-col gap-3 min-h-0">
-                  <div
-                    ref={scrollRef}
-                    onScroll={(e) => {
-                      const el = e.currentTarget;
-                      stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-                    }}
-                    className="flex-1 min-h-0 max-h-[60vh] overflow-y-auto space-y-3 rounded-md border bg-background p-3"
-                  >
-                    {events.length === 0 && (
-                      <div className="text-xs text-muted-foreground flex items-center gap-2">
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Waiting for the worker…
-                      </div>
-                    )}
-                    {events.map((e) => (
-                      <EventRow
-                        key={e.seq}
-                        event={e}
-                        canDecide={
-                          effectiveStatus === "WAITING_APPROVAL" && !!e.approval_id && !decidedIds.has(e.approval_id)
-                        }
-                        onDecide={(id, d) => void decide(id, d)}
-                      />
-                    ))}
-                  </div>
-                  {isFinished && (
-                    <div className="flex gap-2">
-                      <Textarea
-                        value={followUp}
-                        onChange={(e) => setFollowUp(e.target.value)}
-                        placeholder="Continue this conversation…"
-                        rows={2}
-                        className="flex-1"
-                      />
-                      <Button
-                        disabled={submitting || !followUp.trim()}
-                        onClick={() => void submit(followUp, selectedId)}
-                      >
-                        <Play className="h-4 w-4" /> Send
-                      </Button>
+                  <Button size="sm" variant="ghost" onClick={() => void endSession()}>
+                    <XCircle className="h-3.5 w-3.5" /> End session
+                  </Button>
+                </div>
+              )}
+            </CardHeader>
+
+            <CardContent className="flex-1 flex flex-col gap-3 min-h-0">
+              <div
+                ref={scrollRef}
+                onScroll={(e) => {
+                  const el = e.currentTarget;
+                  stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+                }}
+                className="flex-1 min-h-[45vh] max-h-[62vh] overflow-y-auto space-y-3 rounded-md border bg-background p-3"
+              >
+                {!selectedId && (
+                  <div className="text-sm text-muted-foreground space-y-3">
+                    <p>Start a conversation. Claude Code runs in the worker's work directory.</p>
+                    <div className="flex items-center gap-4 text-xs">
+                      <label className="flex items-center gap-1">
+                        <input type="radio" checked={mode === "interactive"} onChange={() => setMode("interactive")} />
+                        Ask me before edits and commands
+                      </label>
+                      <label className="flex items-center gap-1">
+                        <input type="radio" checked={mode === "unattended"} onChange={() => setMode("unattended")} />
+                        Unattended (allowlist only)
+                      </label>
                     </div>
-                  )}
-                </CardContent>
-              </>
-            )}
+                  </div>
+                )}
+                {selectedId && blocks.length === 0 && (
+                  <div className="text-xs text-muted-foreground flex items-center gap-2">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Waiting for the worker…
+                  </div>
+                )}
+                {blocks.map((b) =>
+                  b.kind === "user" ? (
+                    <div key={b.key} className="flex justify-end">
+                      <div className="max-w-[85%] rounded-lg bg-accent px-3 py-2 text-sm whitespace-pre-wrap">{b.text}</div>
+                    </div>
+                  ) : b.kind === "assistant" ? (
+                    <div key={b.key} className="whitespace-pre-wrap text-sm leading-relaxed">{b.text}</div>
+                  ) : (
+                    <EventRow
+                      key={b.key}
+                      event={b.event}
+                      canDecide={
+                        effectiveStatus === "WAITING_APPROVAL" &&
+                        !!b.event.approval_id &&
+                        !decided.has(b.event.approval_id)
+                      }
+                      onDecide={(id, d) => void decide(id, d)}
+                    />
+                  ),
+                )}
+                {isBusy && (
+                  <div className="text-xs text-muted-foreground flex items-center gap-2">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> working… (Esc to interrupt)
+                  </div>
+                )}
+              </div>
+
+              {!isClosed ? (
+                <div className="flex gap-2 items-end">
+                  <Textarea
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    placeholder={
+                      isBusy ? "Type the next message (it runs after the current turn)…" : "Message Claude Code…"
+                    }
+                    rows={2}
+                    className="flex-1 font-mono text-sm"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                        e.preventDefault();
+                        void send();
+                      }
+                    }}
+                  />
+                  <Button disabled={sending || !input.trim()} onClick={() => void send()}>
+                    {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                  </Button>
+                </div>
+              ) : (
+                <div className="text-xs text-muted-foreground">
+                  This session has ended. Start a new one with <Plus className="inline h-3 w-3" />.
+                </div>
+              )}
+            </CardContent>
           </Card>
         </div>
       )}
