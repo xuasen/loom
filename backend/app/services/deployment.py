@@ -311,7 +311,6 @@ def create_runtime(
 
     params: dict[str, Any] = {
         "agentRuntimeName": name,
-        "description": description,
         "agentRuntimeArtifact": {
             "codeConfiguration": {
                 "code": {
@@ -330,6 +329,11 @@ def create_runtime(
         "tags": _merge_tags(extra=tags),
         "platformVersion": "V2",
     }
+
+    # CreateAgentRuntime rejects an empty description (min length 1), and the
+    # form leaves it blank by default: send it only when there is one.
+    if description and description.strip():
+        params["description"] = description.strip()[:4096]
 
     network_config: dict[str, Any] = {"networkMode": network_mode}
     if network_mode == "VPC" and (vpc_subnet_ids or vpc_security_group_ids):
@@ -372,12 +376,10 @@ def create_runtime_endpoint(
 
     client = boto3.client("bedrock-agentcore-control", region_name=region)
 
-    response = client.create_agent_runtime_endpoint(
-        agentRuntimeId=runtime_id,
-        name=name,
-        description=description,
-        tags=_merge_tags(extra=tags),
-    )
+    kwargs: dict[str, Any] = {"agentRuntimeId": runtime_id, "name": name, "tags": _merge_tags(extra=tags)}
+    if description and description.strip():  # same min-length-1 rule as the runtime
+        kwargs["description"] = description.strip()[:256]
+    response = client.create_agent_runtime_endpoint(**kwargs)
     return response
 
 
@@ -496,8 +498,8 @@ def update_runtime(
     client = boto3.client("bedrock-agentcore-control", region_name=region)
 
     params: dict[str, Any] = {"agentRuntimeId": runtime_id, "platformVersion": "V2"}
-    if description is not None:
-        params["description"] = description
+    if description and description.strip():  # min length 1: an empty one is rejected
+        params["description"] = description.strip()[:4096]
     if env_vars is not None:
         params["environmentVariables"] = env_vars
     if role_arn is not None:
