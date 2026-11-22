@@ -35,6 +35,8 @@ WORKER_ID=$WORKER_ID
 AWS_REGION=$AWS_REGION
 IOT_ENDPOINT=$IOT_ENDPOINT
 WORKDIR=$WORKDIR
+FILES_BUCKET=${FILES_BUCKET:-loom-claude-files-$("$INSTALL_DIR/venv/bin/python" -c "import boto3; print(boto3.client('sts', region_name='$AWS_REGION').get_caller_identity()['Account'])")-$AWS_REGION}
+UPLOADS_DIR=$RUN_HOME/loom-uploads
 CLAUDE_CODE_USE_BEDROCK=1
 ANTHROPIC_MODEL=$ANTHROPIC_MODEL
 PATH=$RUN_HOME/.local/bin:$RUN_HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin

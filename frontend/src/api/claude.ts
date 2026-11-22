@@ -11,7 +11,23 @@ import { apiFetch, getAuthToken, getBaseUrl, tryRefreshToken } from "./client";
  */
 
 export type ClaudeSessionStatus = "IDLE" | "RUNNING" | "WAITING_APPROVAL" | "CLOSED" | "FAILED";
-export type ClaudeSessionMode = "interactive" | "unattended";
+/** Claude Code permission modes (Shift+Tab in the CLI) + Loom's "unattended". */
+export type ClaudeSessionMode = "default" | "acceptEdits" | "plan" | "auto" | "unattended";
+
+export const MODE_LABELS: Record<ClaudeSessionMode, string> = {
+  default: "Ask before acting",
+  acceptEdits: "Accept edits",
+  plan: "Plan mode",
+  auto: "Auto mode",
+  unattended: "Unattended (allowlist)",
+};
+/** The order Shift+Tab cycles through, like the CLI. */
+export const MODE_CYCLE: ClaudeSessionMode[] = ["default", "acceptEdits", "plan", "auto"];
+
+export function modelLabel(id: string): string {
+  const m = id.match(/claude-([a-z]+)-(\d+)-(\d+)/);
+  return m ? `${m[1]![0]!.toUpperCase()}${m[1]!.slice(1)} ${m[2]}.${m[3]}` : id;
+}
 
 export const CLOSED_STATUSES: ReadonlySet<ClaudeSessionStatus> = new Set(["CLOSED", "FAILED"]);
 
@@ -29,6 +45,8 @@ export interface ClaudeSession {
   turns: number;
   cost_usd?: number | null;
   cwd?: string | null;
+  model?: string | null;
+  pending_approvals?: string[];
 }
 
 export type ClaudeEventType =
@@ -40,6 +58,8 @@ export type ClaudeEventType =
   | "approval_decision"
   | "status"
   | "turn_end"
+  | "mode"
+  | "model"
   | "error";
 
 export interface ClaudeEvent {
@@ -59,6 +79,9 @@ export interface ClaudeEvent {
   status?: ClaudeSessionStatus;
   message?: string;
   cost_usd?: number;
+  mode?: ClaudeSessionMode;
+  model?: string;
+  attachments?: { name: string; size: number }[];
 }
 
 export interface ClaudeWorker {
@@ -73,6 +96,8 @@ export interface ClaudeWorker {
 export interface ClaudeConfig {
   enabled: boolean;
   workers: ClaudeWorker[];
+  models: string[];
+  modes: ClaudeSessionMode[];
 }
 
 export interface SessionStateFrame {
@@ -99,12 +124,17 @@ export function createClaudeSession(body: {
   mode: ClaudeSessionMode;
   worker_id?: string;
   cwd?: string;
+  model?: string;
+  attachments?: string[];
 }): Promise<ClaudeSession> {
   return apiFetch<ClaudeSession>("/api/claude/sessions", { method: "POST", body: JSON.stringify(body) });
 }
 
-export function sendClaudeMessage(id: string, message: string): Promise<ClaudeSession> {
-  return apiFetch<ClaudeSession>(path(id, "/messages"), { method: "POST", body: JSON.stringify({ message }) });
+export function sendClaudeMessage(id: string, message: string, attachments: string[] = []): Promise<ClaudeSession> {
+  return apiFetch<ClaudeSession>(path(id, "/messages"), {
+    method: "POST",
+    body: JSON.stringify({ message, attachments }),
+  });
 }
 
 export function getClaudeEvents(
@@ -119,6 +149,49 @@ export function decideClaudeApproval(id: string, approvalId: string, decision: "
     method: "POST",
     body: JSON.stringify({ decision }),
   });
+}
+
+export interface UploadedFile {
+  file_id: string;
+  name: string;
+  size: number;
+  content_type: string;
+}
+
+/** Upload one attachment (any type) through the authenticated backend route. */
+export async function uploadClaudeFile(file: File): Promise<UploadedFile> {
+  const send = (token: string | null) => {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    return fetch(`${getBaseUrl()}/api/claude/files`, {
+      method: "POST",
+      body: form,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+  };
+  let response = await send(getAuthToken());
+  if (response.status === 401) {
+    const refreshed = await tryRefreshToken();
+    if (refreshed) response = await send(refreshed);
+  }
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`;
+    try {
+      const body = (await response.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") detail = body.detail;
+    } catch {
+      /* keep default */
+    }
+    throw new Error(detail);
+  }
+  return response.json() as Promise<UploadedFile>;
+}
+
+export function updateClaudeSettings(
+  id: string,
+  settings: { mode?: ClaudeSessionMode; model?: string },
+): Promise<ClaudeSession> {
+  return apiFetch<ClaudeSession>(path(id, "/settings"), { method: "POST", body: JSON.stringify(settings) });
 }
 
 export function interruptClaudeSession(id: string): Promise<void> {

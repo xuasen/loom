@@ -33,7 +33,9 @@ from typing import Any, Literal
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, Depends, HTTPException, Query
+import re
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -45,6 +47,30 @@ router = APIRouter(prefix="/api/claude", tags=["claude"])
 
 REQUIRED_SCOPE = "admin:write"
 KIND = "session"
+# Permission modes: Claude Code's own (what Shift+Tab cycles in the CLI) plus
+# Loom's "unattended" (deny anything off the worker's allowlist instead of
+# asking). bypassPermissions is deliberately not offered.
+Mode = Literal["default", "acceptEdits", "plan", "auto", "unattended"]
+DEFAULT_MODELS = [
+    "us.anthropic.claude-sonnet-4-6",
+    "us.anthropic.claude-opus-4-8",
+    "us.anthropic.claude-opus-4-7",
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+]
+
+
+def _models() -> list[str]:
+    raw = _env("LOOM_CLAUDE_MODELS")
+    models = [m.strip() for m in raw.split(",") if m.strip()] if raw else DEFAULT_MODELS
+    return models
+
+
+def _validate_model(model: str | None) -> str | None:
+    if model is None:
+        return None
+    if model not in _models():
+        raise HTTPException(status_code=400, detail=f"Model not allowed: {model}")
+    return model
 CLOSED_STATES = {"CLOSED", "FAILED"}
 MAX_MESSAGE_CHARS = 20000
 MAX_INBOX = 500
@@ -132,6 +158,8 @@ def _public(item: dict) -> dict:
         "pending_count": _plain(item.get("pending_count") or 0),
         "turns": _plain(item.get("consumed") or 0),
         "cwd": item.get("cwd"),
+        "model": item.get("model"),
+        "pending_approvals": sorted((item.get("pending_approvals") or {}).keys()),
         "cost_usd": _plain(item.get("cost_usd")) if item.get("cost_usd") is not None else None,
     }
 
@@ -156,8 +184,58 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _message(text: str, user: UserInfo) -> dict:
-    return {"id": uuid.uuid4().hex[:12], "text": text, "by": user.username, "at": _now_iso()}
+MAX_UPLOAD_BYTES = int(_env("LOOM_CLAUDE_MAX_UPLOAD_MB", "200")) * 1024 * 1024
+MAX_ATTACHMENTS = 20
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._ ()\[\]+@,-]")
+_s3 = None
+
+
+def _files_bucket() -> str:
+    return _env("LOOM_CLAUDE_FILES_BUCKET")
+
+
+def _s3_client():
+    global _s3
+    if _s3 is None:
+        _s3 = boto3.client("s3", region_name=_region())
+    return _s3
+
+
+def _user_prefix(user: UserInfo) -> str:
+    # Cognito usernames are already restricted; keep the key path tidy anyway.
+    return "uploads/" + re.sub(r"[^A-Za-z0-9._@-]", "_", user.username or user.sub) + "/"
+
+
+def _safe_filename(name: str) -> str:
+    base = (name or "file").replace("\\", "/").rsplit("/", 1)[-1].strip() or "file"
+    base = _SAFE_NAME.sub("_", base).lstrip(".") or "file"
+    return base[:150]
+
+
+def _resolve_attachments(file_ids: list[str], user: UserInfo) -> list[dict]:
+    """Turn upload ids into attachment records; only the caller's own uploads."""
+    if not file_ids:
+        return []
+    if len(file_ids) > MAX_ATTACHMENTS:
+        raise HTTPException(status_code=400, detail=f"At most {MAX_ATTACHMENTS} attachments per message")
+    out = []
+    for fid in file_ids:
+        if not re.fullmatch(r"[a-f0-9]{16}", fid or ""):
+            raise HTTPException(status_code=400, detail="Bad file id")
+        listed = _s3_client().list_objects_v2(Bucket=_files_bucket(), Prefix=f"{_user_prefix(user)}{fid}/", MaxKeys=2)
+        objs = listed.get("Contents") or []
+        if len(objs) != 1:
+            raise HTTPException(status_code=400, detail=f"Unknown attachment {fid}")
+        key = objs[0]["Key"]
+        out.append({"file_id": fid, "key": key, "name": key.rsplit("/", 1)[-1], "size": int(objs[0]["Size"])})
+    return out
+
+
+def _message(text: str, user: UserInfo, attachments: list[dict] | None = None) -> dict:
+    msg: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "text": text, "by": user.username, "at": _now_iso()}
+    if attachments:
+        msg["attachments"] = attachments
+    return msg
 
 
 def _conditional_failed(e: ClientError) -> bool:
@@ -189,7 +267,42 @@ def get_config(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict
     if not any(w["worker_id"] == default_worker for w in workers):
         workers.append({"worker_id": default_worker, "online": False, "last_heartbeat": None, "model": None,
                         "projects": [], "default_cwd": None})
-    return {"enabled": True, "workers": workers}
+    return {"enabled": True, "workers": workers, "models": _models(),
+            "modes": ["default", "acceptEdits", "plan", "auto", "unattended"]}
+
+
+@router.post("/files", status_code=201)
+async def upload_file(
+    file: UploadFile = File(...),
+    user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE)),
+) -> dict:
+    """Store one attachment (any type) in the private files bucket.
+
+    The browser posts it through CloudFront/WAF to this authenticated route;
+    nothing is ever uploaded straight to S3. Returns an id to reference in a
+    message's ``attachments``. Files expire per the bucket lifecycle.
+    """
+    _require_enabled()
+    if not _files_bucket():
+        raise HTTPException(status_code=404, detail="Uploads are not configured")
+    name = _safe_filename(file.filename or "file")
+    content_type = (file.content_type or "application/octet-stream")[:100]
+    # Enforce the size cap while reading, not from a client-declared header.
+    file.file.seek(0, 2)
+    size = file.file.tell()
+    file.file.seek(0)
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+    if size == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+    fid = uuid.uuid4().hex[:16]
+    key = f"{_user_prefix(user)}{fid}/{name}"
+    await asyncio.to_thread(
+        _s3_client().upload_fileobj, file.file, _files_bucket(), key,
+        ExtraArgs={"ContentType": content_type, "Metadata": {"uploaded-by": user.username[:200]}},
+    )
+    logger.info("Claude upload %s (%d bytes, %s) by %s", key, size, content_type, user.username)
+    return {"file_id": fid, "name": name, "size": size, "content_type": content_type}
 
 
 @router.get("/sessions")
@@ -206,7 +319,9 @@ def list_sessions(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> d
 
 class CreateSessionRequest(BaseModel):
     message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
-    mode: Literal["interactive", "unattended"] = "interactive"
+    attachments: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
+    mode: Mode = "default"
+    model: str | None = Field(default=None, max_length=100)
     worker_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     # Project directory on the worker (like `cd <dir> && claude`). The worker
     # re-validates it (must be under its user's home, not a secret location).
@@ -242,7 +357,7 @@ def create_session(req: CreateSessionRequest, user: UserInfo = Depends(require_s
         "worker_id": worker_id,
         "created_at": now,
         "updated_at": now,
-        "inbox": [_message(req.message, user)],
+        "inbox": [_message(req.message, user, _resolve_attachments(req.attachments, user))],
         "consumed": 0,
         "pending_count": 1,
         "last_seq": 0,
@@ -252,6 +367,8 @@ def create_session(req: CreateSessionRequest, user: UserInfo = Depends(require_s
     }
     if req.cwd and ".." not in req.cwd.split("/"):
         item["cwd"] = req.cwd
+    if _validate_model(req.model):
+        item["model"] = req.model
     _sessions().put_item(Item=item, ConditionExpression="attribute_not_exists(task_id)")
     logger.info("Claude session %s opened by %s on %s (mode=%s)", session_id, user.username, worker_id, req.mode)
     _notify(worker_id, "tasks", {"session_id": session_id})
@@ -266,6 +383,7 @@ def get_session(session_id: str, user: UserInfo = Depends(require_scopes(REQUIRE
 
 class SendMessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    attachments: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
 
 
 @router.post("/sessions/{session_id}/messages", status_code=202)
@@ -277,6 +395,7 @@ def send_message(
     """Queue the next user turn. Sending while a turn runs queues it (it runs next)."""
     _require_enabled()
     item = _get_item(session_id)
+    message = _message(req.message, user, _resolve_attachments(req.attachments, user))
     try:
         resp = _sessions().update_item(
             Key={"task_id": session_id},
@@ -285,7 +404,7 @@ def send_message(
             ExpressionAttributeNames={"#s": "status", "#in": "inbox", "#u": "updated_at",
                                       "#pc": "pending_count", "#cr": "close_requested"},
             ExpressionAttributeValues={
-                ":m": [_message(req.message, user)], ":t": _now_iso(), ":one": 1,
+                ":m": [message], ":t": _now_iso(), ":one": 1,
                 ":closed": "CLOSED", ":failed": "FAILED", ":f": False, ":max": MAX_INBOX,
             },
             ReturnValues="ALL_NEW",
@@ -388,23 +507,66 @@ def decide(
     if not approval_id.isalnum() or len(approval_id) > 64:
         raise HTTPException(status_code=400, detail="Bad approval id")
     item = _get_item(session_id)
+    # Accept a decision for any approval the worker has listed as open, not
+    # just while the session-level status says WAITING_APPROVAL: with several
+    # tool calls waiting in parallel, answering one flips the status back.
     try:
         _sessions().update_item(
             Key={"task_id": session_id},
             UpdateExpression="SET #d.#a = :d",
-            ConditionExpression="#s = :waiting AND attribute_not_exists(#d.#a)",
-            ExpressionAttributeNames={"#d": "decisions", "#a": approval_id, "#s": "status"},
-            ExpressionAttributeValues={
-                ":d": {"decision": req.decision, "by": user.username, "at": _now_iso()},
-                ":waiting": "WAITING_APPROVAL",
-            },
+            ConditionExpression="attribute_exists(#pa.#a) AND attribute_not_exists(#d.#a)",
+            ExpressionAttributeNames={"#d": "decisions", "#a": approval_id, "#pa": "pending_approvals"},
+            ExpressionAttributeValues={":d": {"decision": req.decision, "by": user.username, "at": _now_iso()}},
         )
     except ClientError as e:
         if _conditional_failed(e):
-            raise HTTPException(status_code=409, detail="Session is not waiting for this approval") from e
+            raise HTTPException(
+                status_code=409,
+                detail="This approval is no longer open (already answered, the turn ended, or it timed out)",
+            ) from e
         raise
     logger.info("Claude session %s approval %s -> %s by %s", session_id, approval_id, req.decision, user.username)
     _notify(item["worker_id"], "control", {"type": "approval", "session_id": session_id})
+
+
+class SettingsRequest(BaseModel):
+    mode: Mode | None = None
+    model: str | None = Field(default=None, max_length=100)
+
+
+@router.post("/sessions/{session_id}/settings")
+def update_settings(
+    session_id: str,
+    req: SettingsRequest,
+    user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE)),
+) -> dict:
+    """Switch permission mode (Shift+Tab) and/or model (/model) on a live session.
+    Applies immediately, including to a turn that is running."""
+    _require_enabled()
+    item = _get_item(session_id)
+    if item.get("status") in CLOSED_STATES:
+        raise HTTPException(status_code=409, detail="Session has ended")
+    fields: dict[str, Any] = {}
+    if req.mode:
+        fields["mode"] = req.mode
+    if req.model:
+        fields["model"] = _validate_model(req.model)
+    if not fields:
+        return _public(item)
+    names = {f"#{k}": k for k in fields}
+    names["#u"] = "updated_at"
+    values = {f":{k}": v for k, v in fields.items()}
+    values[":t"] = _now_iso()
+    resp = _sessions().update_item(
+        Key={"task_id": session_id},
+        UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in fields) + ", #u = :t",
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+        ReturnValues="ALL_NEW",
+    )
+    logger.info("Claude session %s settings %s by %s", session_id, fields, user.username)
+    _notify(item["worker_id"], "control", {"type": "settings", "session_id": session_id})
+    return _public(resp["Attributes"])
 
 
 @router.post("/sessions/{session_id}/interrupt", status_code=204)

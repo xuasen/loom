@@ -38,7 +38,7 @@ import { listMcpServers } from "@/api/mcp";
 import { listA2aAgents } from "@/api/a2a";
 import { AuthProvider, useAuth, GROUP_SCOPES, type Scope } from "@/contexts/AuthContext";
 import { LoginPage } from "@/pages/LoginPage";
-import { BookOpen, Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, SquareTerminal } from "lucide-react";
+import { BookOpen, Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, SquareTerminal, Menu } from "lucide-react";
 import { AdminDashboardPage } from "./pages/AdminDashboardPage";
 import { ChatPage } from "./pages/ChatPage";
 import { OAuthLinkCallbackPage } from "./pages/OAuthLinkCallbackPage";
@@ -201,6 +201,7 @@ function AppContent() {
   const [activePersona, setActivePersona] = useState<Persona>(getDefaultPersona());
   const [agentInitialTab, setAgentInitialTab] = useState<"details" | "invoke">("details");
   const [viewAsUser, setViewAsUser] = useState<string | null>(null);
+  const [navOpen, setNavOpen] = useState(false); // mobile drawer
   const [pendingMcpId, setPendingMcpId] = useState<number | null>(null);
   const [pendingA2aId, setPendingA2aId] = useState<number | null>(null);
   const [pendingSkillId, setPendingSkillId] = useState<string | null>(null);
@@ -525,9 +526,23 @@ function AppContent() {
   }
 
   return (
-    <div className="h-screen bg-background flex overflow-hidden">
-      {/* Sidebar */}
-      <aside className="w-56 border-r bg-card flex flex-col shrink-0 h-screen overflow-y-auto">
+    <div className="h-dvh bg-background flex overflow-hidden">
+      {/* Mobile: backdrop behind the drawer */}
+      {navOpen && (
+        <button
+          type="button"
+          aria-label="Close menu"
+          className="fixed inset-0 z-30 bg-black/40 md:hidden"
+          onClick={() => setNavOpen(false)}
+        />
+      )}
+      {/* Sidebar: a slide-in drawer below md, a fixed column above */}
+      <aside
+        className={`fixed inset-y-0 left-0 z-40 w-64 border-r bg-card flex flex-col shrink-0 h-dvh overflow-y-auto
+          transition-transform duration-200 ease-out pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]
+          ${navOpen ? "translate-x-0 shadow-xl" : "-translate-x-full"}
+          md:static md:z-auto md:w-56 md:translate-x-0 md:shadow-none md:pt-0 md:pb-0`}
+      >
         <div className="p-4 border-b">
           <img
             src={isLightTheme(theme) ? "/assets/loom_light_alt.png" : "/assets/loom_dark_alt.png"}
@@ -535,7 +550,7 @@ function AppContent() {
             className="h-15"
           />
         </div>
-        <nav className="flex-1 p-2 space-y-3">
+        <nav className="flex-1 p-2 space-y-3" onClick={() => setNavOpen(false)}>
           <SidebarSection label={t("nav.sections.home")}>
             {effectiveHasScope("catalog:read") && (
               <SidebarItem
@@ -694,7 +709,23 @@ function AppContent() {
       </aside>
 
       {/* Main content */}
-      <div className="flex-1 flex flex-col overflow-y-auto">
+      <div className="flex-1 min-w-0 flex flex-col overflow-y-auto">
+        {/* Mobile top bar */}
+        <div className="md:hidden sticky top-0 z-20 flex h-14 shrink-0 items-center gap-3 border-b bg-background/95 px-3 pt-[env(safe-area-inset-top)] backdrop-blur">
+          <button
+            type="button"
+            aria-label="Open menu"
+            onClick={() => setNavOpen(true)}
+            className="flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground hover:bg-accent"
+          >
+            <Menu className="h-5 w-5" />
+          </button>
+          <img
+            src={isLightTheme(theme) ? "/assets/loom_light_alt.png" : "/assets/loom_dark_alt.png"}
+            alt="Loom"
+            className="h-7"
+          />
+        </div>
         {activePersona === "builder" && selectedAgentId !== null && (
           <header className="border-b">
             <div className="max-w-7xl px-8 py-3 flex items-center justify-between gap-4">
@@ -719,7 +750,13 @@ function AppContent() {
           </header>
         )}
 
-        <main className="max-w-7xl px-8 py-6 flex-1 w-full">
+        <main
+          className={
+            activePersona === "claude"
+              ? "flex-1 w-full min-h-0 md:px-6 md:py-4"
+              : "max-w-7xl px-4 py-4 md:px-8 md:py-6 flex-1 w-full"
+          }
+        >
           {activePersona === "catalog" && (
             <CatalogPage
               agents={agents}

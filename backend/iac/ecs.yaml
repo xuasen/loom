@@ -591,6 +591,15 @@ Resources:
                   Resource:
                     - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/loom/claude/tasks/*"
                     - !Sub "arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/loom/claude/control/*"
+                - Effect: Allow
+                  Action: s3:PutObject
+                  Resource: !Sub "arn:aws:s3:::loom-claude-files-${AWS::AccountId}-${AWS::Region}/uploads/*"
+                - Effect: Allow
+                  Action: s3:ListBucket
+                  Resource: !Sub "arn:aws:s3:::loom-claude-files-${AWS::AccountId}-${AWS::Region}"
+                  Condition:
+                    StringLike:
+                      s3:prefix: ["uploads/*"]
           - !Ref AWS::NoValue
       Tags:
         - Key: loom:application
@@ -665,6 +674,8 @@ Resources:
               Value: loom-claude-workers
             - Name: LOOM_CLAUDE_DEFAULT_WORKER
               Value: !Ref pClaudeDefaultWorker
+            - Name: LOOM_CLAUDE_FILES_BUCKET
+              Value: !Sub "loom-claude-files-${AWS::AccountId}-${AWS::Region}"
             - Name: LOG_LEVEL
               Value: info
           Secrets: !If

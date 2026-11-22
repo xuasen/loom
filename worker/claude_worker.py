@@ -33,7 +33,7 @@ from typing import Any
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 log = logging.getLogger("loom-claude-worker")
@@ -44,6 +44,8 @@ IOT_ENDPOINT = os.environ.get("IOT_ENDPOINT", "")
 TASKS_TABLE = os.environ.get("TASKS_TABLE", "loom-claude-tasks")
 EVENTS_TABLE = os.environ.get("EVENTS_TABLE", "loom-claude-events")
 WORKERS_TABLE = os.environ.get("WORKERS_TABLE", "loom-claude-workers")
+FILES_BUCKET = os.environ.get("FILES_BUCKET", "")
+UPLOADS_DIR = os.path.realpath(os.path.expanduser(os.environ.get("UPLOADS_DIR", "~/loom-uploads")))
 WORKDIR = os.path.realpath(os.path.expanduser(os.environ.get("WORKDIR", "~/work")))
 HOME = os.path.realpath(os.path.expanduser("~"))
 # Where to look for projects the UI can open a session in (colon-separated).
@@ -66,10 +68,28 @@ FLUSH_SECONDS = 0.3
 FLUSH_CHARS = 400
 KIND = "session"
 
+# Session modes. The first four are Claude Code's own permission modes (what
+# Shift+Tab cycles in the CLI); "unattended" is Loom's: Claude runs in
+# "default" and our callback denies anything off the allowlist instead of
+# asking. bypassPermissions is deliberately not offered.
+CLAUDE_MODE = {
+    "default": "default",
+    "acceptEdits": "acceptEdits",
+    "plan": "plan",
+    "auto": "auto",
+    "unattended": "default",
+    "interactive": "default",  # legacy name
+}
+
+# Bedrock Claude inference profiles a session may switch to (the role only
+# allows Claude models anyway).
+MODEL_PATTERN = re.compile(r"^(us|global)\.anthropic\.claude-[a-z0-9.:-]+$")
+
 TOPIC_TASKS = f"loom/claude/tasks/{WORKER_ID}"
 TOPIC_CONTROL = f"loom/claude/control/{WORKER_ID}"
 
 ddb = boto3.resource("dynamodb", region_name=REGION)
+s3 = boto3.client("s3", region_name=REGION)
 sessions_t = ddb.Table(TASKS_TABLE)
 events_t = ddb.Table(EVENTS_TABLE)
 workers_t = ddb.Table(WORKERS_TABLE)
@@ -270,6 +290,54 @@ def finish_turn(sid: str, status: str, cost: float | None) -> None:
     )
 
 
+def download_attachments(sid: str, attachments: list[dict]) -> list[dict]:
+    """Fetch a message's attachments into UPLOADS_DIR/<session>/<file id>/<name>."""
+    saved = []
+    for a in attachments or []:
+        key = str(a.get("key", ""))
+        name = os.path.basename(str(a.get("name") or key.rsplit("/", 1)[-1])) or "file"
+        fid = re.sub(r"[^a-f0-9]", "", str(a.get("file_id", "")))[:16] or uuid.uuid4().hex[:16]
+        if not FILES_BUCKET or not key.startswith("uploads/"):
+            continue
+        dest_dir = os.path.join(UPLOADS_DIR, sid, fid)
+        os.makedirs(dest_dir, exist_ok=True)
+        dest = os.path.join(dest_dir, name)
+        s3.download_file(FILES_BUCKET, key, dest)
+        saved.append({"path": dest, "name": name, "size": int(a.get("size") or os.path.getsize(dest))})
+    return saved
+
+
+def attachment_note(saved: list[dict]) -> str:
+    if not saved:
+        return ""
+    lines = [f"- {f['path']} ({f['size']} bytes)" for f in saved]
+    return ("\n\n[The user attached these files; they are saved on this machine. Read images and PDFs "
+            "with the Read tool; unpack archives into a scratch directory before reading them.]\n" + "\n".join(lines))
+
+
+def open_approval(sid: str, approval_id: str) -> None:
+    sessions_t.update_item(
+        Key={"task_id": sid},
+        UpdateExpression="SET #pa = if_not_exists(#pa, :empty)",
+        ExpressionAttributeNames={"#pa": "pending_approvals"},
+        ExpressionAttributeValues={":empty": {}},
+    )
+    sessions_t.update_item(
+        Key={"task_id": sid},
+        UpdateExpression="SET #pa.#a = :t",
+        ExpressionAttributeNames={"#pa": "pending_approvals", "#a": approval_id},
+        ExpressionAttributeValues={":t": now_iso()},
+    )
+
+
+def close_approval(sid: str, approval_id: str) -> None:
+    sessions_t.update_item(
+        Key={"task_id": sid},
+        UpdateExpression="REMOVE #pa.#a",
+        ExpressionAttributeNames={"#pa": "pending_approvals", "#a": approval_id},
+    )
+
+
 def heartbeat(active: list[str], projects: list[str]) -> None:
     workers_t.put_item(Item={
         "worker_id": WORKER_ID,
@@ -323,17 +391,80 @@ class LiveSession:
     def __init__(self, worker: "Worker", item: dict) -> None:
         self.worker = worker
         self.sid: str = item["task_id"]
-        self.mode: str = item.get("mode", "interactive")
+        self.mode: str = item.get("mode") if item.get("mode") in CLAUDE_MODE else "default"
+        self.model: str = item.get("model") if MODEL_PATTERN.match(item.get("model") or "") else MODEL
+        self.open_approvals = 0
         self.claude_session_id: str | None = item.get("claude_session_id") or None
         self.cwd = resolve_cwd(item.get("cwd"))
+        self.uploads_dir = os.path.join(UPLOADS_DIR, self.sid)
+        os.makedirs(self.uploads_dir, exist_ok=True)
         self.stream = EventStream(self.sid, int(item.get("last_seq") or 0))
         self.client: ClaudeSDKClient | None = None
         self.last_used = time.monotonic()
 
+    async def _guard_hook(self, input_data: dict, _tool_use_id: Any, _ctx: Any) -> dict:
+        """PreToolUse hook: runs in EVERY permission mode (auto and acceptEdits
+        approve calls without reaching can_use_tool), and deny wins over any
+        allow. Errors propagate so on_failure="block" blocks the call."""
+        tool = input_data.get("tool_name", "")
+        reason = hard_deny_reason(tool, input_data.get("tool_input") or {}, self.cwd)
+        if not reason:
+            return {}
+        await self.stream.emit("error", message=f"Blocked {tool}: {reason}")
+        return {"hookSpecificOutput": {
+            "hookEventName": input_data.get("hook_event_name", "PreToolUse"),
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }}
+
+    async def apply_mode(self, mode: str) -> None:
+        """Switch permission mode (like Shift+Tab); takes effect immediately."""
+        if mode not in CLAUDE_MODE or mode == self.mode:
+            return
+        previous = self.mode
+        self.mode = mode
+        if self.client is not None and CLAUDE_MODE[mode] != CLAUDE_MODE[previous]:
+            try:
+                await self.client.set_permission_mode(CLAUDE_MODE[mode])
+            except Exception as e:  # noqa: BLE001 - e.g. auto mode unavailable for this model
+                self.mode = previous
+                await asyncio.to_thread(set_fields, self.sid, mode=previous)
+                await self.stream.emit("error", message=f"Could not switch to {mode}: {e}")
+                return
+        await self.stream.emit("mode", mode=mode, message=f"mode → {mode}")
+
+    async def apply_model(self, model: str) -> None:
+        """Switch model mid-session (like /model); applies to the next request."""
+        if not MODEL_PATTERN.match(model or "") or model == self.model:
+            return
+        previous = self.model
+        self.model = model
+        if self.client is not None:
+            try:
+                await self.client.set_model(model)
+            except Exception as e:  # noqa: BLE001
+                self.model = previous
+                await asyncio.to_thread(set_fields, self.sid, model=previous)
+                await self.stream.emit("error", message=f"Could not switch model to {model}: {e}")
+                return
+        await self.stream.emit("model", model=model, message=f"model → {model}")
+
+    async def sync_settings(self, item: dict) -> None:
+        """Apply mode/model changes the UI wrote to the session record."""
+        if item.get("mode") in CLAUDE_MODE and item.get("mode") != self.mode:
+            if self.client is None:
+                self.mode = item["mode"]
+            else:
+                await self.apply_mode(item["mode"])
+        if MODEL_PATTERN.match(item.get("model") or "") and item.get("model") != self.model:
+            if self.client is None:
+                self.model = item["model"]
+            else:
+                await self.apply_model(item["model"])
+
     async def _can_use_tool(self, tool: str, tool_input: dict, _ctx: Any):
-        reason = hard_deny_reason(tool, tool_input, self.cwd)
+        reason = hard_deny_reason(tool, tool_input, self.cwd)  # belt and braces; the hook already ran
         if reason:
-            await self.stream.emit("error", message=f"Blocked {tool}: {reason}")
             return PermissionResultDeny(message=reason, interrupt=False)
         if tool in READ_ONLY_TOOLS:
             return PermissionResultAllow(updated_input=tool_input)
@@ -347,8 +478,22 @@ class LiveSession:
 
     async def _ask_human(self, tool: str, tool_input: dict):
         approval_id = uuid.uuid4().hex[:12]
+        # Register the approval as open BEFORE announcing it: the backend
+        # accepts a decision only for an id listed in pending_approvals, so
+        # several parallel approvals can each be answered.
+        await asyncio.to_thread(open_approval, self.sid, approval_id)
+        self.open_approvals += 1
         await self.stream.emit("approval_request", tool=tool, input=tool_input, approval_id=approval_id)
         await self.stream.status("WAITING_APPROVAL", f"waiting for approval of {tool}")
+        try:
+            return await self._wait_decision(tool, tool_input, approval_id)
+        finally:
+            self.open_approvals -= 1
+            await asyncio.to_thread(close_approval, self.sid, approval_id)
+            if self.open_approvals == 0:
+                await self.stream.status("RUNNING", None)
+
+    async def _wait_decision(self, tool: str, tool_input: dict, approval_id: str):
         deadline = time.monotonic() + APPROVAL_TIMEOUT_S
         decision, by = "deny", "timeout"
         while time.monotonic() < deadline:
@@ -360,9 +505,9 @@ class LiveSession:
             if item.get("interrupt_requested") or item.get("close_requested"):
                 decision, by = "deny", "interrupt"
                 break
+            await self.sync_settings(item)
             await self.worker.wait_control(2)
         await self.stream.emit("approval_decision", approval_id=approval_id, decision=decision, decided_by=by)
-        await self.stream.status("RUNNING", None)
         if decision == "allow":
             return PermissionResultAllow(updated_input=tool_input)
         return PermissionResultDeny(message=f"Denied by {by}", interrupt=False)
@@ -373,15 +518,22 @@ class LiveSession:
             # Code's own system prompt (the SDK's default is a bare prompt),
             # user/project/local settings, CLAUDE.md, skills, .mcp.json and the
             # per-project memory under ~/.claude/projects/<cwd>.
+            try:
+                guard = HookMatcher(matcher=None, hooks=[self._guard_hook], on_failure="block")
+            except TypeError:  # older SDK without on_failure
+                guard = HookMatcher(matcher=None, hooks=[self._guard_hook])
             options = ClaudeAgentOptions(
                 cwd=self.cwd,
-                model=MODEL,
+                model=self.model,
                 max_turns=MAX_TURNS,
                 resume=self.claude_session_id,
+                permission_mode=CLAUDE_MODE[self.mode],
                 can_use_tool=self._can_use_tool,
+                hooks={"PreToolUse": [guard]},
                 include_partial_messages=True,
                 system_prompt={"type": "preset", "preset": "claude_code"},
                 setting_sources=["user", "project", "local"],
+                add_dirs=[self.uploads_dir],
             )
             client = ClaudeSDKClient(options=options)
             await client.connect()
@@ -402,8 +554,21 @@ class LiveSession:
     async def run_turn(self, message: dict) -> tuple[str, float | None]:
         """Run one user turn. Returns (status after the turn, cost)."""
         self.last_used = time.monotonic()
-        await self.stream.emit("user_message", text=message.get("text", ""), by=message.get("by"))
+        await self.sync_settings(await asyncio.to_thread(get_session, self.sid) or {})
+        attachments = message.get("attachments") or []
+        await self.stream.emit(
+            "user_message", text=message.get("text", ""), by=message.get("by"),
+            attachments=[{"name": a.get("name"), "size": a.get("size")} for a in attachments] or None,
+        )
         await self.stream.status("RUNNING", None)
+        prompt = message.get("text", "")
+        if attachments:
+            try:
+                saved = await asyncio.to_thread(download_attachments, self.sid, attachments)
+                prompt += attachment_note(saved)
+            except Exception as e:  # noqa: BLE001 - tell the user, still run the turn
+                log.exception("session %s: attachment download failed", self.sid)
+                await self.stream.emit("error", message=f"Could not fetch attachments: {type(e).__name__}: {e}")
 
         interrupted = False
         cost: float | None = None
@@ -427,6 +592,7 @@ class LiveSession:
                 while True:
                     await self.worker.wait_control(1)
                     item = await asyncio.to_thread(get_session, self.sid) or {}
+                    await self.sync_settings(item)
                     if item.get("interrupt_requested") or item.get("close_requested"):
                         interrupted = True
                         await self.stream.emit("status", status="RUNNING", message="interrupting…")
@@ -435,7 +601,7 @@ class LiveSession:
 
             watcher = asyncio.create_task(watch_interrupt())
             try:
-                await client.query(message.get("text", ""))
+                await client.query(prompt)
                 async for msg in client.receive_response():
                     kind = type(msg).__name__
                     if kind == "StreamEvent":
@@ -577,6 +743,7 @@ class Worker:
                 await stream.emit("error", message="Worker restarted during this turn; it was stopped. "
                                                    "Send a message to continue the conversation.")
                 await asyncio.to_thread(finish_turn, sid, "IDLE", None)
+                await asyncio.to_thread(set_fields, sid, pending_approvals={})
                 await stream.emit("status", status="IDLE", message=None)
             except Exception:  # noqa: BLE001
                 log.exception("session %s: orphan recovery failed", sid)

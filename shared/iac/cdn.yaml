@@ -52,6 +52,11 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesCommonRuleSet
+              # The 8 KB body limit is re-applied by LargeBodyExceptUpload
+              # below for every path except the authenticated upload route.
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse: { Count: {} }
           VisibilityConfig:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
@@ -68,6 +73,30 @@ Resources:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
             MetricName: known-bad-inputs
+        - Name: LargeBodyExceptUpload
+          Priority: 2
+          Action:
+            Block: {}
+          Statement:
+            AndStatement:
+              Statements:
+                - SizeConstraintStatement:
+                    FieldToMatch:
+                      Body: { OversizeHandling: MATCH }
+                    ComparisonOperator: GT
+                    Size: 8192
+                    TextTransformations: [{ Priority: 0, Type: NONE }]
+                - NotStatement:
+                    Statement:
+                      ByteMatchStatement:
+                        FieldToMatch: { UriPath: {} }
+                        PositionalConstraint: EXACTLY
+                        SearchString: /api/claude/files
+                        TextTransformations: [{ Priority: 0, Type: NONE }]
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: large-body-except-upload
       Tags:
         - Key: loom:application
           Value: !Ref pTagApplication

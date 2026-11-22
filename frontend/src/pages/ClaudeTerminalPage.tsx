@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle, Check, Loader2, Plus, RefreshCw, Send, Square, SquareTerminal, X, XCircle,
+  AlertTriangle, ArrowDown, Check, ChevronLeft, ChevronRight, FileText, Folder, Loader2, Paperclip, Plus,
+  RefreshCw, Send, Shield, Sparkles, Square, SquareTerminal, X, XCircle,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Textarea } from "@/components/ui/textarea";
+import { MarkdownBlock } from "@/components/MarkdownRenderer";
 import { ApiError } from "@/api/client";
 import {
   CLOSED_STATUSES,
+  MODE_CYCLE,
+  MODE_LABELS,
   closeClaudeSession,
   createClaudeSession,
   decideClaudeApproval,
@@ -18,8 +19,11 @@ import {
   getClaudeSession,
   interruptClaudeSession,
   listClaudeSessions,
+  modelLabel,
   sendClaudeMessage,
   streamClaudeEvents,
+  updateClaudeSettings,
+  uploadClaudeFile,
   type ClaudeConfig,
   type ClaudeEvent,
   type ClaudeSession,
@@ -30,28 +34,23 @@ import {
 const POLL_INTERVAL_MS = 2000;
 const RECONNECT_DELAY_MS = 600;
 
-function statusVariant(status: ClaudeSessionStatus): "success" | "warning" | "destructive" | "neutral" | "secondary" {
-  switch (status) {
-    case "IDLE":
-      return "success";
-    case "WAITING_APPROVAL":
-      return "warning";
-    case "FAILED":
-      return "destructive";
-    case "CLOSED":
-      return "neutral";
-    default:
-      return "secondary";
-  }
-}
-
 const STATUS_LABEL: Record<ClaudeSessionStatus, string> = {
-  IDLE: "ready",
-  RUNNING: "working",
-  WAITING_APPROVAL: "needs approval",
-  CLOSED: "ended",
-  FAILED: "failed",
+  IDLE: "Ready",
+  RUNNING: "Working",
+  WAITING_APPROVAL: "Needs approval",
+  CLOSED: "Ended",
+  FAILED: "Failed",
 };
+
+const STATUS_DOT: Record<ClaudeSessionStatus, string> = {
+  IDLE: "bg-success",
+  RUNNING: "bg-primary animate-pulse",
+  WAITING_APPROVAL: "bg-warning animate-pulse",
+  CLOSED: "bg-muted-foreground/40",
+  FAILED: "bg-destructive",
+};
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function shortJson(value: unknown, max = 400): string {
   let text: string;
@@ -63,7 +62,38 @@ function shortJson(value: unknown, max = 400): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function relativeTime(iso?: string | null): string {
+  if (!iso) return "";
+  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+function shortPath(p?: string | null): string {
+  if (!p) return "";
+  const parts = p.split("/").filter(Boolean);
+  return parts.length <= 2 ? p : `…/${parts.slice(-2).join("/")}`;
+}
+
+function useIsTouch(): boolean {
+  const [touch, setTouch] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(pointer: coarse)");
+    setTouch(mq.matches);
+    const on = (e: MediaQueryListEvent) => setTouch(e.matches);
+    mq.addEventListener("change", on);
+    return () => mq.removeEventListener("change", on);
+  }, []);
+  return touch;
+}
 
 /** History first, then the live stream (reconnecting); events de-duplicated by seq. */
 function useSessionEvents(sessionId: string | null) {
@@ -126,7 +156,7 @@ function useSessionEvents(sessionId: string | null) {
             },
             signal,
           );
-          await sleep(RECONNECT_DELAY_MS); // server ends streams periodically; resume from last seq
+          await sleep(RECONNECT_DELAY_MS);
         } catch {
           if (signal.aborted) return;
           setConnected(false);
@@ -147,7 +177,7 @@ function useSessionEvents(sessionId: string | null) {
 }
 
 type Block =
-  | { kind: "user"; key: number; text: string; by?: string }
+  | { kind: "user"; key: number; text: string; attachments: { name: string; size: number }[] }
   | { kind: "assistant"; key: number; text: string }
   | { kind: "event"; key: number; event: ClaudeEvent };
 
@@ -160,9 +190,9 @@ function toBlocks(events: ClaudeEvent[]): Block[] {
       if (prev && prev.kind === "assistant") prev.text += e.text ?? "";
       else blocks.push({ kind: "assistant", key: e.seq, text: e.text ?? "" });
     } else if (e.type === "user_message") {
-      blocks.push({ kind: "user", key: e.seq, text: e.text ?? "", by: e.by });
+      blocks.push({ kind: "user", key: e.seq, text: e.text ?? "", attachments: e.attachments ?? [] });
     } else if (e.type === "status" && !e.message) {
-      // plain state changes are shown in the header, not the transcript
+      // plain state changes live in the header, not the transcript
     } else {
       blocks.push({ kind: "event", key: e.seq, event: e });
     }
@@ -170,45 +200,80 @@ function toBlocks(events: ClaudeEvent[]): Block[] {
   return blocks;
 }
 
+/** Approvals still waiting: requested, not decided, and no later turn end. */
+function openApprovalIds(events: ClaudeEvent[]): Set<string> {
+  const open = new Set<string>();
+  for (const e of events) {
+    if (e.type === "approval_request" && e.approval_id) open.add(e.approval_id);
+    else if (e.type === "approval_decision" && e.approval_id) open.delete(e.approval_id);
+    else if (e.type === "turn_end") open.clear();
+  }
+  return open;
+}
+
+function ToolRow({ event }: { event: ClaudeEvent }) {
+  return (
+    <div className="flex items-start gap-2 font-mono text-xs text-muted-foreground min-w-0">
+      <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-primary/70" />
+      <span className="min-w-0 break-words">
+        <span className="text-foreground font-medium">{event.tool}</span>{" "}
+        <span className="opacity-80">{shortJson(event.input, 240)}</span>
+      </span>
+    </div>
+  );
+}
+
 function EventRow({
   event,
-  canDecide,
+  open,
   onDecide,
 }: {
   event: ClaudeEvent;
-  canDecide: boolean;
+  open: boolean;
   onDecide: (approvalId: string, decision: "allow" | "deny") => void;
 }) {
   switch (event.type) {
     case "tool_use":
-      return (
-        <div className="font-mono text-xs text-muted-foreground">
-          <span className="text-foreground">● {event.tool}</span> {shortJson(event.input)}
-        </div>
-      );
+      return <ToolRow event={event} />;
     case "tool_result":
       return (
-        <details className="font-mono text-xs pl-3">
-          <summary className={event.is_error ? "text-destructive cursor-pointer" : "text-muted-foreground cursor-pointer"}>
-            {event.is_error ? "⎿ error" : "⎿ result"} ({(event.output ?? "").length} chars)
+        <details className="group pl-3.5 font-mono text-xs">
+          <summary
+            className={`flex cursor-pointer list-none items-center gap-1 py-1 ${
+              event.is_error ? "text-destructive" : "text-muted-foreground"
+            }`}
+          >
+            <ChevronRight className="h-3 w-3 transition-transform group-open:rotate-90" />
+            {event.is_error ? "Error" : "Output"} · {(event.output ?? "").length.toLocaleString()} chars
           </summary>
-          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap rounded border bg-muted/40 p-2">{event.output}</pre>
+          <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/40 p-2.5">
+            {event.output}
+          </pre>
         </details>
       );
     case "approval_request":
       return (
-        <div className="rounded-md border border-warning/50 bg-warning-bg p-3 text-sm space-y-2">
+        <div
+          className={`rounded-xl border p-3 text-sm space-y-2.5 ${
+            open ? "border-warning/60 bg-warning-bg" : "border-border bg-muted/30 opacity-80"
+          }`}
+        >
           <div className="flex items-center gap-2 font-medium">
-            <AlertTriangle className="h-4 w-4 text-warning" /> Allow {event.tool}?
+            <Shield className="h-4 w-4 text-warning shrink-0" />
+            <span>
+              Allow <span className="font-mono">{event.tool}</span>?
+            </span>
           </div>
-          <pre className="max-h-48 overflow-auto whitespace-pre-wrap font-mono text-xs">{shortJson(event.input, 2000)}</pre>
-          {canDecide && event.approval_id && (
-            <div className="flex gap-2">
-              <Button size="sm" onClick={() => onDecide(event.approval_id!, "allow")}>
-                <Check className="h-3.5 w-3.5" /> Allow
+          <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-2 font-mono text-xs">
+            {shortJson(event.input, 3000)}
+          </pre>
+          {open && event.approval_id && (
+            <div className="grid grid-cols-2 gap-2">
+              <Button className="h-11" onClick={() => onDecide(event.approval_id!, "allow")}>
+                <Check className="h-4 w-4" /> Allow
               </Button>
-              <Button size="sm" variant="outline" onClick={() => onDecide(event.approval_id!, "deny")}>
-                <X className="h-3.5 w-3.5" /> Deny
+              <Button className="h-11" variant="outline" onClick={() => onDecide(event.approval_id!, "deny")}>
+                <X className="h-4 w-4" /> Deny
               </Button>
             </div>
           )}
@@ -216,9 +281,21 @@ function EventRow({
       );
     case "approval_decision":
       return (
-        <div className="text-xs text-muted-foreground">
-          {event.decision === "allow" ? "✓ allowed" : "✗ denied"}
-          {event.decided_by ? ` by ${event.decided_by}` : ""}
+        <div className={`text-xs ${event.decision === "allow" ? "text-success" : "text-muted-foreground"}`}>
+          {event.decision === "allow" ? "✓ Allowed" : "✗ Denied"}
+          {event.decided_by ? ` · ${event.decided_by}` : ""}
+        </div>
+      );
+    case "mode":
+      return (
+        <div className="text-center text-[11px] text-muted-foreground">
+          — {event.mode ? MODE_LABELS[event.mode] : event.message} —
+        </div>
+      );
+    case "model":
+      return (
+        <div className="text-center text-[11px] text-muted-foreground">
+          — {event.model ? modelLabel(event.model) : event.message} —
         </div>
       );
     case "status":
@@ -226,39 +303,107 @@ function EventRow({
     case "turn_end":
       return (
         <div className="text-[10px] text-muted-foreground/70">
-          {event.message === "interrupted" ? "interrupted" : event.is_error ? "turn ended with an error" : "done"}
+          {event.message === "interrupted" ? "Interrupted" : event.is_error ? "Ended with an error" : "Done"}
           {typeof event.cost_usd === "number" ? ` · $${event.cost_usd.toFixed(4)}` : ""}
         </div>
       );
     case "error":
-      return <div className="whitespace-pre-wrap text-sm text-destructive">{event.message ?? event.text}</div>;
+      return (
+        <div className="flex items-start gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="whitespace-pre-wrap break-words">{event.message ?? event.text}</span>
+        </div>
+      );
     default:
       return null;
   }
 }
 
+/** A chip that looks like a pill but is a native <select> (native pickers on phones). */
+function PillSelect<T extends string>({
+  icon,
+  value,
+  options,
+  onChange,
+  label,
+  disabled,
+}: {
+  icon: React.ReactNode;
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+  label: string;
+  disabled?: boolean;
+}) {
+  const current = options.find((o) => o.value === value)?.label ?? value;
+  return (
+    <label
+      className={`relative inline-flex h-8 max-w-[11rem] shrink-0 items-center gap-1.5 rounded-full border bg-background px-3 text-xs text-muted-foreground transition-colors ${
+        disabled ? "opacity-50" : "hover:bg-accent hover:text-foreground"
+      }`}
+      title={label}
+    >
+      {icon}
+      <span className="truncate">{current}</span>
+      <select
+        aria-label={label}
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value as T)}
+        className="absolute inset-0 cursor-pointer opacity-0"
+      >
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+interface PendingFile {
+  localId: string;
+  file: File;
+  fileId?: string;
+  error?: string;
+}
+
 export function ClaudeTerminalPage() {
+  const isTouch = useIsTouch();
   const [config, setConfig] = useState<ClaudeConfig | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<ClaudeSession[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selected, setSelected] = useState<ClaudeSession | null>(null);
+  // Mobile master/detail: show the conversation pane instead of the list.
+  const [showConversation, setShowConversation] = useState(false);
+
   const [input, setInput] = useState("");
-  const [mode, setMode] = useState<ClaudeSessionMode>("interactive");
-  const [cwd, setCwd] = useState<string>("");
   const [sending, setSending] = useState(false);
+  const [files, setFiles] = useState<PendingFile[]>([]);
+  const [dragOver, setDragOver] = useState(false);
+
+  // Settings for a new session, or the live values of the selected one.
+  const [mode, setMode] = useState<ClaudeSessionMode>("default");
+  const [model, setModel] = useState<string>("");
+  const [cwd, setCwd] = useState<string>("");
+
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const stickRef = useRef(true);
+  const [showJump, setShowJump] = useState(false);
 
   const { events, status, pending, connected } = useSessionEvents(selectedId);
   const blocks = useMemo(() => toBlocks(events), [events]);
+  const openApprovals = useMemo(() => openApprovalIds(events), [events]);
   const effectiveStatus: ClaudeSessionStatus | null = status ?? selected?.status ?? null;
   const isClosed = effectiveStatus !== null && CLOSED_STATUSES.has(effectiveStatus);
   const isBusy = effectiveStatus === "RUNNING" || effectiveStatus === "WAITING_APPROVAL";
-  const decided = useMemo(
-    () => new Set(events.filter((e) => e.type === "approval_decision").map((e) => e.approval_id)),
-    [events],
-  );
+  const worker = config?.workers[0];
+  const models = config?.models ?? [];
+  const uploading = files.some((f) => !f.fileId && !f.error);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -272,6 +417,7 @@ export function ClaudeTerminalPage() {
     getClaudeConfig()
       .then((cfg) => {
         setConfig(cfg);
+        if (cfg.models[0]) setModel((m) => m || cfg.models[0]!);
         if (cfg.enabled) void refreshSessions();
       })
       .catch((e: unknown) => {
@@ -283,15 +429,30 @@ export function ClaudeTerminalPage() {
       });
   }, [refreshSessions]);
 
+  // Load the selected session and adopt its live mode/model in the pickers.
   useEffect(() => {
     if (!selectedId) {
       setSelected(null);
       return;
     }
-    getClaudeSession(selectedId).then(setSelected).catch(() => setSelected(null));
+    getClaudeSession(selectedId)
+      .then((s) => {
+        setSelected(s);
+        if (s.mode && (MODE_LABELS as Record<string, string>)[s.mode]) setMode(s.mode);
+        if (s.model) setModel(s.model);
+      })
+      .catch(() => setSelected(null));
   }, [selectedId]);
 
-  // Keep list badges fresh while any session is active.
+  // Follow mode/model changes announced in the stream.
+  useEffect(() => {
+    const last = [...events].reverse();
+    const m = last.find((e) => e.type === "mode" && e.mode);
+    const md = last.find((e) => e.type === "model" && e.model);
+    if (m?.mode) setMode(m.mode);
+    if (md?.model) setModel(md.model);
+  }, [events]);
+
   useEffect(() => {
     if (!sessions.some((s) => s.status === "RUNNING" || s.status === "WAITING_APPROVAL")) return;
     const id = setInterval(() => void refreshSessions(), 10000);
@@ -309,24 +470,84 @@ export function ClaudeTerminalPage() {
     if (el && stickRef.current) el.scrollTop = el.scrollHeight;
   }, [blocks]);
 
+  // Auto-grow the composer up to ~8 lines.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  }, [input]);
+
+  const openSession = (id: string | null) => {
+    setSelectedId(id);
+    setShowConversation(true);
+    stickRef.current = true;
+    setShowJump(false);
+    if (!id) {
+      setMode("default");
+      setCwd("");
+      if (models[0]) setModel(models[0]);
+    }
+  };
+
+  const addFiles = useCallback((list: FileList | File[]) => {
+    const incoming = Array.from(list).slice(0, 20);
+    if (incoming.length === 0) return;
+    const entries: PendingFile[] = incoming.map((file) => ({ localId: crypto.randomUUID(), file }));
+    setFiles((prev) => [...prev, ...entries]);
+    for (const entry of entries) {
+      uploadClaudeFile(entry.file)
+        .then((r) => setFiles((prev) => prev.map((f) => (f.localId === entry.localId ? { ...f, fileId: r.file_id } : f))))
+        .catch((e: unknown) =>
+          setFiles((prev) =>
+            prev.map((f) => (f.localId === entry.localId ? { ...f, error: (e as Error).message } : f)),
+          ),
+        );
+    }
+  }, []);
+
   const send = async () => {
     const text = input.trim();
-    if (!text || sending) return;
+    if (!text || sending || uploading) return;
+    const attachments = files.filter((f) => f.fileId).map((f) => f.fileId!);
     setSending(true);
     try {
       if (!selectedId) {
-        const s = await createClaudeSession({ message: text, mode, cwd: cwd || undefined });
+        const s = await createClaudeSession({
+          message: text, mode, model: model || undefined, cwd: cwd || undefined, attachments,
+        });
         setSessions((prev) => [s, ...prev]);
         setSelectedId(s.session_id);
       } else {
-        await sendClaudeMessage(selectedId, text);
+        await sendClaudeMessage(selectedId, text, attachments);
       }
       setInput("");
+      setFiles([]);
       stickRef.current = true;
     } catch (e) {
       toast.error(`Could not send: ${(e as Error).message}`);
     } finally {
       setSending(false);
+    }
+  };
+
+  const changeMode = async (next: ClaudeSessionMode) => {
+    setMode(next);
+    if (!selectedId || isClosed) return;
+    try {
+      await updateClaudeSettings(selectedId, { mode: next });
+    } catch (e) {
+      toast.error(`Could not switch mode: ${(e as Error).message}`);
+    }
+  };
+
+  const changeModel = async (next: string) => {
+    setModel(next);
+    if (!selectedId || isClosed) return;
+    try {
+      await updateClaudeSettings(selectedId, { model: next });
+    } catch (e) {
+      toast.error(`Could not switch model: ${(e as Error).message}`);
     }
   };
 
@@ -354,7 +575,7 @@ export function ClaudeTerminalPage() {
     try {
       await decideClaudeApproval(selectedId, approvalId, decision);
     } catch (e) {
-      toast.error(`Could not send decision: ${(e as Error).message}`);
+      toast.error((e as Error).message);
     }
   };
 
@@ -368,219 +589,386 @@ export function ClaudeTerminalPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, [isBusy, interrupt]);
 
-  const worker = config?.workers[0];
+  const modeOptions = (config?.modes ?? MODE_CYCLE).map((m) => ({ value: m, label: MODE_LABELS[m] }));
+  const modelOptions = models.map((m) => ({ value: m, label: modelLabel(m) }));
+  const projectOptions = [
+    { value: "", label: shortPath(worker?.default_cwd) || "Default work dir" },
+    ...(worker?.projects ?? [])
+      .filter((p) => p !== worker?.default_cwd)
+      .map((p) => ({ value: p, label: shortPath(p) })),
+  ];
 
-  return (
-    <div className="space-y-4">
-      <div className="flex items-start justify-between flex-wrap gap-3">
-        <div>
-          <h2 className="text-2xl font-semibold flex items-center gap-2">
-            <SquareTerminal className="h-6 w-6" /> Claude Terminal
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Conversations with Claude Code on a private worker. A session keeps its context across messages,
-            keeps working after you sign out, and can be replayed.
-          </p>
+  if (configError) {
+    return (
+      <div className="p-4 md:p-0">
+        <div className="flex items-center gap-2 rounded-xl border p-6 text-sm text-muted-foreground">
+          <AlertTriangle className="h-4 w-4 text-warning" /> {configError}
         </div>
-        {config?.enabled && worker && (
-          <Badge variant={worker.online ? "success" : "neutral"}>
-            {worker.worker_id} {worker.online ? "online" : "offline"}
-          </Badge>
+      </div>
+    );
+  }
+  if (!config) {
+    return (
+      <div className="flex items-center gap-2 p-4 text-sm text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin" /> Loading…
+      </div>
+    );
+  }
+
+  const sessionList = (
+    <aside
+      className={`${showConversation ? "hidden" : "flex"} md:flex min-h-0 w-full flex-col border-r bg-card md:w-72 md:rounded-l-xl`}
+    >
+      <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b px-4">
+        <div className="flex items-center gap-2 min-w-0">
+          <SquareTerminal className="h-5 w-5 shrink-0" />
+          <span className="font-semibold truncate">Claude Terminal</span>
+        </div>
+        <div className="flex items-center gap-1">
+          <Button size="icon-sm" variant="ghost" onClick={() => void refreshSessions()} aria-label="Refresh">
+            <RefreshCw className="h-4 w-4" />
+          </Button>
+          <Button size="icon-sm" onClick={() => openSession(null)} aria-label="New session">
+            <Plus className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+      {worker && (
+        <div className="flex items-center gap-2 border-b px-4 py-2 text-xs text-muted-foreground">
+          <span className={`h-2 w-2 rounded-full ${worker.online ? "bg-success" : "bg-muted-foreground/40"}`} />
+          {worker.worker_id} · {worker.online ? "online" : "offline"}
+        </div>
+      )}
+      <div className="flex-1 overflow-y-auto overscroll-contain p-2">
+        {sessions.length === 0 && (
+          <div className="px-3 py-10 text-center text-sm text-muted-foreground">
+            No sessions yet.
+            <div className="mt-3">
+              <Button size="sm" onClick={() => openSession(null)}>
+                <Plus className="h-4 w-4" /> New session
+              </Button>
+            </div>
+          </div>
+        )}
+        {sessions.map((s) => (
+          <button
+            key={s.session_id}
+            type="button"
+            onClick={() => openSession(s.session_id)}
+            className={`w-full rounded-lg px-3 py-3 text-left transition-colors md:py-2.5 ${
+              s.session_id === selectedId ? "bg-accent" : "hover:bg-accent/50 active:bg-accent"
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <span className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[s.status]}`} />
+              <span className="min-w-0 flex-1 truncate text-sm font-medium">{s.title || "Untitled"}</span>
+              <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground md:hidden" />
+            </div>
+            <div className="mt-0.5 pl-4 text-xs text-muted-foreground truncate">
+              {STATUS_LABEL[s.status]} · {relativeTime(s.updated_at ?? s.created_at)} · {s.turns} turns
+              {s.cwd ? ` · ${shortPath(s.cwd)}` : ""}
+            </div>
+          </button>
+        ))}
+      </div>
+    </aside>
+  );
+
+  const header = (
+    <div className="flex h-14 shrink-0 items-center gap-2 border-b px-2 md:px-4">
+      <Button
+        size="icon-sm"
+        variant="ghost"
+        className="md:hidden"
+        onClick={() => setShowConversation(false)}
+        aria-label="Back to sessions"
+      >
+        <ChevronLeft className="h-5 w-5" />
+      </Button>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-semibold">
+          {selectedId ? selected?.title || "Session" : "New session"}
+        </div>
+        {selectedId && effectiveStatus && (
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[effectiveStatus]}`} />
+            <span>{STATUS_LABEL[effectiveStatus]}</span>
+            {isBusy && pending > 1 && <span>· {pending - 1} queued</span>}
+            {connected && !isClosed && <span className="hidden sm:inline">· live</span>}
+            {selected?.cwd && <span className="hidden truncate font-mono sm:inline">· {shortPath(selected.cwd)}</span>}
+          </div>
         )}
       </div>
-
-      {configError && (
-        <Card>
-          <CardContent className="py-6 text-sm text-muted-foreground flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4 text-warning" /> {configError}
-          </CardContent>
-        </Card>
+      {selectedId && !isClosed && (
+        <Button size="sm" variant="ghost" onClick={() => void endSession()} className="text-muted-foreground">
+          <XCircle className="h-4 w-4" />
+          <span className="hidden sm:inline">End</span>
+        </Button>
       )}
-      {!configError && !config && (
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin" /> Loading…
-        </div>
-      )}
+    </div>
+  );
 
-      {config?.enabled && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[280px_1fr]">
-          <Card className="h-fit">
-            <CardHeader className="pb-2 flex flex-row items-center justify-between">
-              <CardTitle className="text-sm">Sessions</CardTitle>
-              <div className="flex gap-1">
-                <Button size="icon-xs" variant="ghost" onClick={() => void refreshSessions()} title="Refresh">
-                  <RefreshCw />
-                </Button>
-                <Button size="icon-xs" variant="ghost" onClick={() => setSelectedId(null)} title="New session">
-                  <Plus />
-                </Button>
+  const transcript = (
+    <div className="relative min-h-0 flex-1">
+      <div
+        ref={scrollRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+          stickRef.current = atBottom;
+          setShowJump(!atBottom);
+        }}
+        className="h-full overflow-y-auto overscroll-contain px-3 py-4 md:px-6"
+      >
+        <div className="mx-auto max-w-3xl space-y-4">
+          {!selectedId && (
+            <div className="mx-auto max-w-md py-8 text-center">
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-accent">
+                <Sparkles className="h-6 w-6" />
               </div>
-            </CardHeader>
-            <CardContent className="p-2 space-y-1 max-h-[70vh] overflow-y-auto">
-              {sessions.length === 0 && <div className="px-2 py-4 text-xs text-muted-foreground">No sessions yet.</div>}
-              {sessions.map((s) => (
-                <button
-                  key={s.session_id}
-                  type="button"
-                  onClick={() => setSelectedId(s.session_id)}
-                  className={`w-full rounded-md px-2 py-2 text-left text-xs transition-colors ${
-                    s.session_id === selectedId ? "bg-accent" : "hover:bg-accent/50"
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate font-medium">{s.title}</span>
-                    <Badge variant={statusVariant(s.status)}>{STATUS_LABEL[s.status]}</Badge>
-                  </div>
-                  <div className="mt-0.5 text-muted-foreground">
-                    {new Date(s.updated_at ?? s.created_at).toLocaleString()} · {s.turns} turns
-                  </div>
-                </button>
-              ))}
-            </CardContent>
-          </Card>
-
-          <Card className="flex flex-col min-h-[70vh]">
-            <CardHeader className="pb-2 flex flex-row items-center justify-between gap-2">
-              <div className="min-w-0">
-                <CardTitle className="text-sm truncate">
-                  {selectedId ? selected?.title ?? selectedId : "New session"}
-                </CardTitle>
-                {selectedId && (
-                  <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
-                    {effectiveStatus && (
-                      <Badge variant={statusVariant(effectiveStatus)}>{STATUS_LABEL[effectiveStatus]}</Badge>
-                    )}
-                    {pending > 0 && isBusy && <span>{pending - 1 > 0 ? `${pending - 1} queued` : ""}</span>}
-                    {connected && !isClosed && (
-                      <span className="flex items-center gap-1">
-                        <span className="h-2 w-2 rounded-full bg-success animate-pulse" /> live
-                      </span>
-                    )}
-                    {selected && <span>{selected.mode}</span>}
-                    {selected?.cwd && <span className="font-mono truncate">{selected.cwd}</span>}
-                  </div>
-                )}
+              <h3 className="text-lg font-semibold">Start a Claude Code session</h3>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Pick a project — it runs like <code className="font-mono">cd &lt;project&gt; &amp;&amp; claude</code>, with
+                that project's CLAUDE.md, skills, MCP servers and memory.
+              </p>
+              <div className="mt-5 flex justify-center">
+                <PillSelect
+                  icon={<Folder className="h-3.5 w-3.5 shrink-0" />}
+                  value={cwd}
+                  options={projectOptions}
+                  onChange={setCwd}
+                  label="Project"
+                />
               </div>
-              {selectedId && !isClosed && (
-                <div className="flex gap-2">
-                  {isBusy && (
-                    <Button size="sm" variant="outline" onClick={() => void interrupt()} title="Esc">
-                      <Square className="h-3.5 w-3.5" /> Interrupt
-                    </Button>
+            </div>
+          )}
+          {selectedId && blocks.length === 0 && (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" /> Waiting for the worker…
+            </div>
+          )}
+          {blocks.map((b) =>
+            b.kind === "user" ? (
+              <div key={b.key} className="flex justify-end">
+                <div className="max-w-[88%] rounded-2xl rounded-br-md bg-primary px-3.5 py-2.5 text-sm text-primary-foreground md:max-w-[75%]">
+                  <div className="whitespace-pre-wrap break-words">{b.text}</div>
+                  {b.attachments.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {b.attachments.map((a, i) => (
+                        <span
+                          key={i}
+                          className="inline-flex max-w-full items-center gap-1 rounded-md bg-primary-foreground/15 px-2 py-0.5 text-xs"
+                        >
+                          <FileText className="h-3 w-3 shrink-0" />
+                          <span className="truncate">{a.name}</span>
+                        </span>
+                      ))}
+                    </div>
                   )}
-                  <Button size="sm" variant="ghost" onClick={() => void endSession()}>
-                    <XCircle className="h-3.5 w-3.5" /> End session
-                  </Button>
                 </div>
-              )}
-            </CardHeader>
-
-            <CardContent className="flex-1 flex flex-col gap-3 min-h-0">
-              <div
-                ref={scrollRef}
-                onScroll={(e) => {
-                  const el = e.currentTarget;
-                  stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-                }}
-                className="flex-1 min-h-[45vh] max-h-[62vh] overflow-y-auto space-y-3 rounded-md border bg-background p-3"
-              >
-                {!selectedId && (
-                  <div className="text-sm text-muted-foreground space-y-3">
-                    <p>
-                      Start a conversation. Pick the project to run in — like <code>cd &lt;project&gt; &amp;&amp; claude</code>,
-                      so its CLAUDE.md, skills, MCP servers and memory load.
-                    </p>
-                    <label className="flex items-center gap-2 text-xs">
-                      Project
-                      <select
-                        value={cwd}
-                        onChange={(e) => setCwd(e.target.value)}
-                        className="h-8 min-w-[18rem] rounded-md border bg-background px-2 font-mono text-xs"
-                      >
-                        <option value="">{worker?.default_cwd ?? "default work directory"}</option>
-                        {(worker?.projects ?? [])
-                          .filter((p) => p !== worker?.default_cwd)
-                          .map((p) => (
-                            <option key={p} value={p}>
-                              {p}
-                            </option>
-                          ))}
-                      </select>
-                    </label>
-                    <div className="flex items-center gap-4 text-xs">
-                      <label className="flex items-center gap-1">
-                        <input type="radio" checked={mode === "interactive"} onChange={() => setMode("interactive")} />
-                        Ask me before edits and commands
-                      </label>
-                      <label className="flex items-center gap-1">
-                        <input type="radio" checked={mode === "unattended"} onChange={() => setMode("unattended")} />
-                        Unattended (allowlist only)
-                      </label>
-                    </div>
-                  </div>
-                )}
-                {selectedId && blocks.length === 0 && (
-                  <div className="text-xs text-muted-foreground flex items-center gap-2">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Waiting for the worker…
-                  </div>
-                )}
-                {blocks.map((b) =>
-                  b.kind === "user" ? (
-                    <div key={b.key} className="flex justify-end">
-                      <div className="max-w-[85%] rounded-lg bg-accent px-3 py-2 text-sm whitespace-pre-wrap">{b.text}</div>
-                    </div>
-                  ) : b.kind === "assistant" ? (
-                    <div key={b.key} className="whitespace-pre-wrap text-sm leading-relaxed">{b.text}</div>
-                  ) : (
-                    <EventRow
-                      key={b.key}
-                      event={b.event}
-                      canDecide={
-                        effectiveStatus === "WAITING_APPROVAL" &&
-                        !!b.event.approval_id &&
-                        !decided.has(b.event.approval_id)
-                      }
-                      onDecide={(id, d) => void decide(id, d)}
-                    />
-                  ),
-                )}
-                {isBusy && (
-                  <div className="text-xs text-muted-foreground flex items-center gap-2">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> working… (Esc to interrupt)
-                  </div>
-                )}
               </div>
-
-              {!isClosed ? (
-                <div className="flex gap-2 items-end">
-                  <Textarea
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    placeholder={
-                      isBusy ? "Type the next message (it runs after the current turn)…" : "Message Claude Code…"
-                    }
-                    rows={2}
-                    className="flex-1 font-mono text-sm"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-                        e.preventDefault();
-                        void send();
-                      }
-                    }}
-                  />
-                  <Button disabled={sending || !input.trim()} onClick={() => void send()}>
-                    {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                  </Button>
-                </div>
-              ) : (
-                <div className="text-xs text-muted-foreground">
-                  This session has ended. Start a new one with <Plus className="inline h-3 w-3" />.
-                </div>
-              )}
-            </CardContent>
-          </Card>
+            ) : b.kind === "assistant" ? (
+              <MarkdownBlock key={b.key} text={b.text} className="min-w-0 break-words text-sm leading-relaxed" />
+            ) : (
+              <EventRow
+                key={b.key}
+                event={b.event}
+                open={!!b.event.approval_id && openApprovals.has(b.event.approval_id) && !isClosed}
+                onDecide={(id, d) => void decide(id, d)}
+              />
+            ),
+          )}
+          {isBusy && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span className="flex gap-1">
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground [animation-delay:-0.3s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground [animation-delay:-0.15s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground" />
+              </span>
+              {effectiveStatus === "WAITING_APPROVAL" ? "Waiting for your approval" : "Working"}
+              {!isTouch && <span className="opacity-70">· Esc to interrupt</span>}
+            </div>
+          )}
         </div>
+      </div>
+      {showJump && (
+        <button
+          type="button"
+          onClick={() => {
+            const el = scrollRef.current;
+            if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+          }}
+          className="absolute bottom-3 left-1/2 flex h-9 -translate-x-1/2 items-center gap-1 rounded-full border bg-background px-3 text-xs shadow-md"
+        >
+          <ArrowDown className="h-3.5 w-3.5" /> Latest
+        </button>
       )}
+    </div>
+  );
+
+  const composer = isClosed ? (
+    <div className="shrink-0 border-t px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] text-center text-sm text-muted-foreground">
+      This session has ended.{" "}
+      <button type="button" className="font-medium text-foreground underline" onClick={() => openSession(null)}>
+        Start a new one
+      </button>
+    </div>
+  ) : (
+    <div
+      className={`shrink-0 border-t bg-background px-2 pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] md:px-4 md:pb-3 ${
+        dragOver ? "bg-accent/40" : ""
+      }`}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+      }}
+    >
+      <div className="mx-auto max-w-3xl">
+        {files.length > 0 && (
+          <div className="mb-2 flex gap-1.5 overflow-x-auto pb-1">
+            {files.map((f) => (
+              <span
+                key={f.localId}
+                className={`inline-flex h-8 max-w-[14rem] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs ${
+                  f.error ? "border-destructive/50 text-destructive" : ""
+                }`}
+                title={f.error ?? f.file.name}
+              >
+                {f.error ? (
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                ) : f.fileId ? (
+                  <FileText className="h-3.5 w-3.5 shrink-0" />
+                ) : (
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                )}
+                <span className="truncate">{f.file.name}</span>
+                <span className="shrink-0 text-muted-foreground">{humanSize(f.file.size)}</span>
+                <button
+                  type="button"
+                  aria-label={`Remove ${f.file.name}`}
+                  className="-mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded hover:bg-accent"
+                  onClick={() => setFiles((prev) => prev.filter((x) => x.localId !== f.localId))}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div className="rounded-2xl border bg-card shadow-sm focus-within:ring-2 focus-within:ring-ring/40">
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onPaste={(e) => {
+              if (e.clipboardData.files.length) {
+                e.preventDefault();
+                addFiles(e.clipboardData.files);
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Tab" && e.shiftKey) {
+                // Shift+Tab cycles the permission mode, like the CLI.
+                e.preventDefault();
+                const i = MODE_CYCLE.indexOf(mode);
+                void changeMode(MODE_CYCLE[(i + 1) % MODE_CYCLE.length]!);
+                return;
+              }
+              if (e.key === "Enter" && !e.shiftKey && !isTouch && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+            rows={1}
+            placeholder={isBusy ? "Queue the next message…" : selectedId ? "Reply to Claude…" : "What should Claude do?"}
+            className="block max-h-[200px] w-full resize-none bg-transparent px-3.5 pt-3 pb-1 text-base outline-none placeholder:text-muted-foreground md:text-sm"
+          />
+          <div className="flex items-center gap-1.5 px-2 pb-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files) addFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              className="h-8 w-8 shrink-0 rounded-full"
+              onClick={() => fileInputRef.current?.click()}
+              aria-label="Attach files"
+            >
+              <Paperclip className="h-4 w-4" />
+            </Button>
+            <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
+              <PillSelect
+                icon={<Shield className="h-3.5 w-3.5 shrink-0" />}
+                value={mode}
+                options={modeOptions}
+                onChange={(v) => void changeMode(v)}
+                label="Permission mode (Shift+Tab)"
+              />
+              {modelOptions.length > 0 && (
+                <PillSelect
+                  icon={<Sparkles className="h-3.5 w-3.5 shrink-0" />}
+                  value={model || modelOptions[0]!.value}
+                  options={modelOptions}
+                  onChange={(v) => void changeModel(v)}
+                  label="Model"
+                />
+              )}
+            </div>
+            {isBusy && !input.trim() ? (
+              <Button
+                size="icon-sm"
+                variant="outline"
+                className="h-9 w-9 shrink-0 rounded-full"
+                onClick={() => void interrupt()}
+                aria-label="Interrupt"
+                title="Interrupt (Esc)"
+              >
+                <Square className="h-3.5 w-3.5 fill-current" />
+              </Button>
+            ) : (
+              <Button
+                size="icon-sm"
+                className="h-9 w-9 shrink-0 rounded-full"
+                disabled={sending || uploading || !input.trim()}
+                onClick={() => void send()}
+                aria-label="Send"
+              >
+                {sending || uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              </Button>
+            )}
+          </div>
+        </div>
+        {!isTouch && (
+          <div className="mt-1.5 hidden px-2 text-[10px] text-muted-foreground/70 md:block">
+            Enter to send · Shift+Enter new line · Shift+Tab switch mode · drop or paste files to attach
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="flex h-[calc(100dvh-3.5rem)] min-h-0 overflow-hidden bg-background md:h-[calc(100dvh-2rem)] md:rounded-xl md:border">
+      {sessionList}
+      <section className={`${showConversation ? "flex" : "hidden"} md:flex min-h-0 min-w-0 flex-1 flex-col`}>
+        {header}
+        {transcript}
+        {composer}
+      </section>
     </div>
   );
 }

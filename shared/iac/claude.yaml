@@ -10,6 +10,10 @@ Parameters:
     Type: Number
     Default: 365
     Description: Events expire (DynamoDB TTL) this many days after they are written
+  pUploadRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Uploaded attachments are deleted this many days after upload
   pTagApplication:
     Type: String
     Default: loom
@@ -67,6 +71,50 @@ Resources:
         - { Key: loom:group, Value: !Ref pTagGroup }
         - { Key: loom:owner, Value: !Ref pTagOwner }
 
+  # Files users attach to messages. Written by the backend only (uploads go
+  # through CloudFront/WAF -> backend), read by workers. Private, TLS-only.
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "loom-claude-files-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUploads
+            Status: Enabled
+            ExpirationInDays: !Ref pUploadRetentionDays
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+      LoggingConfiguration:
+        DestinationBucketName: !Sub "loom-logs-${AWS::AccountId}-${AWS::Region}"
+        LogFilePrefix: claude-files/
+      Tags:
+        - { Key: loom:application, Value: !Ref pTagApplication }
+        - { Key: loom:group, Value: !Ref pTagGroup }
+        - { Key: loom:owner, Value: !Ref pTagOwner }
+
+  FilesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FilesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt FilesBucket.Arn, !Sub "${FilesBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
   WorkersTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -86,4 +134,5 @@ Outputs:
   oTasksTable: { Value: !Ref TasksTable }
   oEventsTable: { Value: !Ref EventsTable }
   oWorkersTable: { Value: !Ref WorkersTable }
+  oFilesBucket: { Value: !Ref FilesBucket }
   oEventRetentionDays: { Value: !Ref pEventRetentionDays }
