@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle, ArrowDown, Check, ChevronLeft, ChevronRight, FileText, Folder, Loader2, Paperclip, Plus,
-  RefreshCw, Send, Shield, Sparkles, Square, SquareTerminal, X, XCircle,
+  AlertTriangle, ArrowDown, Bell, BellOff, Check, ChevronLeft, ChevronRight, Clock, CornerDownRight, FileText,
+  Folder, Loader2, Paperclip, Plus, RefreshCw, Send, Shield, Sparkles, Square, SquareTerminal, X, XCircle,
 } from "lucide-react";
+import { ClaudeSchedulesPanel } from "@/components/ClaudeSchedulesPanel";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { MarkdownBlock } from "@/components/MarkdownRenderer";
@@ -13,13 +14,17 @@ import {
   MODE_LABELS,
   closeClaudeSession,
   createClaudeSession,
+  currentPushSubscription,
   decideClaudeApproval,
+  disablePush,
+  enablePush,
   getClaudeConfig,
   getClaudeEvents,
   getClaudeSession,
   interruptClaudeSession,
   listClaudeSessions,
   modelLabel,
+  pushSupported,
   sendClaudeMessage,
   streamClaudeEvents,
   updateClaudeSettings,
@@ -177,7 +182,14 @@ function useSessionEvents(sessionId: string | null) {
 }
 
 type Block =
-  | { kind: "user"; key: number; text: string; attachments: { name: string; size: number }[] }
+  | {
+      kind: "user";
+      key: number;
+      text: string;
+      attachments: { name: string; size: number }[];
+      steer?: boolean;
+      scheduled?: string;
+    }
   | { kind: "assistant"; key: number; text: string }
   | { kind: "event"; key: number; event: ClaudeEvent };
 
@@ -190,7 +202,10 @@ function toBlocks(events: ClaudeEvent[]): Block[] {
       if (prev && prev.kind === "assistant") prev.text += e.text ?? "";
       else blocks.push({ kind: "assistant", key: e.seq, text: e.text ?? "" });
     } else if (e.type === "user_message") {
-      blocks.push({ kind: "user", key: e.seq, text: e.text ?? "", attachments: e.attachments ?? [] });
+      blocks.push({
+        kind: "user", key: e.seq, text: e.text ?? "", attachments: e.attachments ?? [],
+        steer: e.steer, scheduled: e.scheduled,
+      });
     } else if (e.type === "status" && !e.message) {
       // plain state changes live in the header, not the transcript
     } else {
@@ -385,6 +400,9 @@ export function ClaudeTerminalPage() {
   const [sending, setSending] = useState(false);
   const [files, setFiles] = useState<PendingFile[]>([]);
   const [dragOver, setDragOver] = useState(false);
+  const [showSchedules, setShowSchedules] = useState(false);
+  const [pushOn, setPushOn] = useState(false);
+  const [pushBusy, setPushBusy] = useState(false);
 
   // Settings for a new session, or the live values of the selected one.
   const [mode, setMode] = useState<ClaudeSessionMode>("default");
@@ -431,6 +449,52 @@ export function ClaudeTerminalPage() {
         );
       });
   }, [refreshSessions]);
+
+  // Deep link (?session=<id>), e.g. from a notification.
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("session");
+    if (id && /^[a-f0-9]{8,32}$/.test(id)) {
+      setSelectedId(id);
+      setShowConversation(true);
+    }
+  }, []);
+
+  // Keep the URL on the open session, so a notification for it can be skipped.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (selectedId) url.searchParams.set("session", selectedId);
+    else url.searchParams.delete("session");
+    window.history.replaceState(window.history.state, "", url);
+  }, [selectedId]);
+
+  useEffect(() => {
+    const key = config?.vapid_public_key;
+    if (!key || !pushSupported() || Notification.permission !== "granted") return;
+    currentPushSubscription(key)
+      .then((s) => setPushOn(!!s))
+      .catch(() => setPushOn(false));
+  }, [config?.vapid_public_key]);
+
+  const togglePush = async () => {
+    const key = config?.vapid_public_key;
+    if (!key) return;
+    setPushBusy(true);
+    try {
+      if (pushOn) {
+        await disablePush();
+        setPushOn(false);
+        toast.success("Notifications off for this device");
+      } else {
+        await enablePush(key);
+        setPushOn(true);
+        toast.success("Notifications on: approvals and finished turns will alert this device");
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setPushBusy(false);
+    }
+  };
 
   // Load the selected session and adopt its live mode/model in the pickers.
   useEffect(() => {
@@ -629,6 +693,21 @@ export function ClaudeTerminalPage() {
           <span className="font-semibold truncate">Claude Terminal</span>
         </div>
         <div className="flex items-center gap-1">
+          {config.vapid_public_key && pushSupported() && (
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              onClick={() => void togglePush()}
+              disabled={pushBusy}
+              aria-label={pushOn ? "Turn notifications off" : "Turn notifications on"}
+              title={pushOn ? "Notifications on (tap to turn off)" : "Notify me about approvals and finished turns"}
+            >
+              {pushOn ? <Bell className="h-4 w-4 text-primary" /> : <BellOff className="h-4 w-4" />}
+            </Button>
+          )}
+          <Button size="icon-sm" variant="ghost" onClick={() => setShowSchedules(true)} aria-label="Schedules" title="Schedules">
+            <Clock className="h-4 w-4" />
+          </Button>
           <Button size="icon-sm" variant="ghost" onClick={() => void refreshSessions()} aria-label="Refresh">
             <RefreshCw className="h-4 w-4" />
           </Button>
@@ -697,7 +776,7 @@ export function ClaudeTerminalPage() {
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <span className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[effectiveStatus]}`} />
             <span>{STATUS_LABEL[effectiveStatus]}</span>
-            {isBusy && pending > 1 && <span>· {pending - 1} queued</span>}
+            {isBusy && pending > 1 && <span>· {pending - 1} waiting</span>}
             {connected && !isClosed && <span className="hidden sm:inline">· live</span>}
             {selected?.cwd && <span className="hidden truncate font-mono sm:inline">· {shortPath(selected.cwd)}</span>}
           </div>
@@ -755,6 +834,19 @@ export function ClaudeTerminalPage() {
             b.kind === "user" ? (
               <div key={b.key} className="flex justify-end">
                 <div className="max-w-[88%] rounded-2xl rounded-br-md bg-primary px-3.5 py-2.5 text-sm text-primary-foreground md:max-w-[75%]">
+                  {(b.steer || b.scheduled) && (
+                    <div className="mb-1 flex items-center gap-1 text-[11px] opacity-75">
+                      {b.steer ? (
+                        <>
+                          <CornerDownRight className="h-3 w-3" /> 插话（执行中送达）
+                        </>
+                      ) : (
+                        <>
+                          <Clock className="h-3 w-3" /> 定时：{b.scheduled}
+                        </>
+                      )}
+                    </div>
+                  )}
                   <div className="whitespace-pre-wrap break-words">{b.text}</div>
                   {b.attachments.length > 0 && (
                     <div className="mt-2 flex flex-wrap gap-1.5">
@@ -892,7 +984,13 @@ export function ClaudeTerminalPage() {
               }
             }}
             rows={1}
-            placeholder={isBusy ? "Queue the next message…" : selectedId ? "Reply to Claude…" : "What should Claude do?"}
+            placeholder={
+              isBusy
+                ? "Steer Claude… (read when the current tool finishes)"
+                : selectedId
+                  ? "Reply to Claude…"
+                  : "What should Claude do?"
+            }
             className="block max-h-[200px] w-full resize-none bg-transparent px-3.5 pt-3 pb-1 text-base outline-none placeholder:text-muted-foreground md:text-sm"
           />
           <div className="flex items-center gap-1.5 px-2 pb-2">
@@ -974,6 +1072,21 @@ export function ClaudeTerminalPage() {
         {transcript}
         {composer}
       </section>
+      {showSchedules && (
+        <ClaudeSchedulesPanel
+          onClose={() => {
+            setShowSchedules(false);
+            void refreshSessions();
+          }}
+          currentSessionId={selectedId && !isClosed ? selectedId : null}
+          cwd={cwd || selected?.cwd || undefined}
+          model={model || undefined}
+          onOpenSession={(id) => {
+            void refreshSessions();
+            openSession(id);
+          }}
+        />
+      )}
     </div>
   );
 }

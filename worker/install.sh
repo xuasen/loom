@@ -39,6 +39,7 @@ FILES_BUCKET=${FILES_BUCKET:-loom-claude-files-$("$INSTALL_DIR/venv/bin/python" 
 UPLOADS_DIR=$RUN_HOME/loom-uploads
 CLAUDE_CODE_USE_BEDROCK=1
 ANTHROPIC_MODEL=$ANTHROPIC_MODEL
+PUSH_SUBJECT=${PUSH_SUBJECT:-https://loom.omniboxkit.com}
 PATH=$RUN_HOME/.local/bin:$RUN_HOME/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 EOF
 chmod 0640 "$ENV_FILE"

@@ -188,6 +188,8 @@ function AppContent() {
 
   // Determine default persona based on user's scopes
   const getDefaultPersona = useCallback((): Persona => {
+    // Deep link from a Claude Terminal notification: /claude?session=<id>
+    if (new URLSearchParams(window.location.search).has("session") && hasScope("admin:write")) return "claude";
     if (hasScope("catalog:read")) return "catalog";
     if (hasScope("security:read") || hasScope("security:write")) return "security";
     if (hasScope("memory:read") || hasScope("memory:write")) return "memory";

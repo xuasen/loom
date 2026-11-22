@@ -62,6 +62,17 @@ APPROVAL_TIMEOUT_S = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", "1800"))
 EVENT_TTL_DAYS = int(os.environ.get("EVENT_TTL_DAYS", "365"))
 IDLE_RELEASE_SECONDS = int(os.environ.get("IDLE_RELEASE_SECONDS", "1800"))
 MAX_LIVE_SESSIONS = int(os.environ.get("MAX_LIVE_SESSIONS", "4"))
+# Web Push: the worker signs notifications with its own VAPID key (generated on
+# first start, kept on this host only) and posts them to the browser's push
+# service. PUSH_SUBJECT is the contact the push services see (mailto: or https:).
+VAPID_KEY_FILE = os.path.expanduser(os.environ.get("VAPID_KEY_FILE", "~/.config/loom-claude-worker/vapid_private.pem"))
+PUSH_SUBJECT = os.environ.get("PUSH_SUBJECT", "")
+PUSH_MIN_TURN_SECONDS = int(os.environ.get("PUSH_MIN_TURN_SECONDS", "20"))
+PUSH_HOSTS = re.compile(
+    r"^(fcm\.googleapis\.com|updates\.push\.services\.mozilla\.com|web\.push\.apple\.com|"
+    r"[a-z0-9-]+\.push\.apple\.com|[a-z0-9-]+\.notify\.windows\.com)$"
+)
+SCHEDULE_CHECK_SECONDS = 20
 POLL_SECONDS = 15
 HEARTBEAT_SECONDS = 30
 FLUSH_SECONDS = 0.3
@@ -274,10 +285,12 @@ def claim_turn(sid: str) -> bool:
         raise
 
 
-def finish_turn(sid: str, status: str, cost: float | None) -> None:
+def finish_turn(sid: str, status: str, cost: float | None, steered: int = 0) -> None:
+    """End a turn: the message that started it plus any steered into it are consumed."""
     names = {"#s": "status", "#u": "updated_at", "#ir": "interrupt_requested", "#c": "consumed",
              "#pc": "pending_count"}
-    values: dict[str, Any] = {":s": status, ":t": now_iso(), ":f": False, ":one": 1, ":neg": -1}
+    values: dict[str, Any] = {":s": status, ":t": now_iso(), ":f": False, ":one": 1 + steered,
+                              ":neg": -(1 + steered)}
     sets = "#s = :s, #u = :t, #ir = :f, #c = #c + :one"
     if cost is not None:
         names["#cost"] = "cost_usd"
@@ -338,8 +351,8 @@ def close_approval(sid: str, approval_id: str) -> None:
     )
 
 
-def heartbeat(active: list[str], projects: list[str]) -> None:
-    workers_t.put_item(Item={
+def heartbeat(active: list[str], projects: list[str], vapid_public_key: str | None) -> None:
+    item = {
         "worker_id": WORKER_ID,
         "last_heartbeat": now_iso(),
         "last_heartbeat_epoch": Decimal(str(round(time.time(), 1))),
@@ -347,7 +360,196 @@ def heartbeat(active: list[str], projects: list[str]) -> None:
         "model": MODEL,
         "projects": projects,
         "default_cwd": WORKDIR,
-    })
+    }
+    if vapid_public_key:
+        item["vapid_public_key"] = vapid_public_key
+    workers_t.put_item(Item=item)
+
+
+# ---------------------------------------------------------------------------
+# Web Push (notifications to the session owner's browsers/phones)
+# ---------------------------------------------------------------------------
+def load_vapid_public_key() -> str | None:
+    """Create the VAPID key pair on first use; return the public key (base64url)."""
+    try:
+        import base64
+
+        from cryptography.hazmat.primitives import serialization
+        from py_vapid import Vapid02
+
+        if os.path.exists(VAPID_KEY_FILE):
+            vapid = Vapid02.from_file(VAPID_KEY_FILE)
+        else:
+            os.makedirs(os.path.dirname(VAPID_KEY_FILE), mode=0o700, exist_ok=True)
+            vapid = Vapid02()
+            vapid.generate_keys()
+            old = os.umask(0o077)
+            try:
+                vapid.save_key(VAPID_KEY_FILE)
+            finally:
+                os.umask(old)
+            log.info("Generated VAPID key at %s", VAPID_KEY_FILE)
+        raw = vapid.public_key.public_bytes(serialization.Encoding.X962,
+                                            serialization.PublicFormat.UncompressedPoint)
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    except Exception as e:  # noqa: BLE001 - notifications are optional
+        log.warning("Web Push disabled: %s", e)
+        return None
+
+
+def push_subscriptions(user: str) -> list[dict]:
+    resp = sessions_t.query(
+        IndexName="by_created", KeyConditionExpression=Key("kind").eq("push"),
+        FilterExpression=Attr("submitted_by").eq(user) & Attr("enabled").eq(True), Limit=500,
+    )
+    return resp.get("Items", [])
+
+
+def send_push(user: str, payload: dict) -> None:
+    if not user or not PUSH_SUBJECT or not os.path.exists(VAPID_KEY_FILE):
+        return
+    from urllib.parse import urlparse
+
+    from pywebpush import WebPushException, webpush
+
+    data = json.dumps(payload, ensure_ascii=False)
+    for sub in push_subscriptions(user):
+        endpoint = str(sub.get("endpoint", ""))
+        host = urlparse(endpoint).hostname or ""
+        if not endpoint.startswith("https://") or not PUSH_HOSTS.match(host):
+            continue
+        try:
+            webpush(
+                subscription_info={"endpoint": endpoint, "keys": dict(sub.get("keys") or {})},
+                data=data, vapid_private_key=VAPID_KEY_FILE, vapid_claims={"sub": PUSH_SUBJECT},
+                ttl=3600, timeout=10,
+            )
+        except WebPushException as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (403, 404, 410):  # expired, unsubscribed, or signed with another key
+                set_fields(sub["task_id"], enabled=False)
+                log.info("push subscription %s disabled (HTTP %s)", sub["task_id"], code)
+            else:
+                log.warning("push to %s failed: %s", host, e)
+        except Exception as e:  # noqa: BLE001
+            log.warning("push to %s failed: %s", host, e)
+
+
+# ---------------------------------------------------------------------------
+# Scheduled prompts
+# ---------------------------------------------------------------------------
+def next_run(cron: str, tz: str) -> datetime:
+    from zoneinfo import ZoneInfo
+
+    from croniter import croniter
+
+    return croniter(cron, datetime.now(ZoneInfo(tz))).get_next(datetime)
+
+
+def due_schedules() -> list[dict]:
+    flt = (Attr("worker_id").eq(WORKER_ID) & Attr("enabled").eq(True) & Attr("deleted").ne(True)
+           & (Attr("next_run_epoch").lte(int(time.time())) | Attr("run_now").eq(True)))
+    resp = sessions_t.query(IndexName="by_created", KeyConditionExpression=Key("kind").eq("schedule"),
+                            FilterExpression=flt, Limit=500)
+    return resp.get("Items", [])
+
+
+def claim_schedule(item: dict) -> bool:
+    """Advance the schedule before firing it, so a run fires once (missed runs
+    while the worker was down collapse into one)."""
+    try:
+        if item.get("run_now") and int(item.get("next_run_epoch") or 0) > time.time():
+            sessions_t.update_item(
+                Key={"task_id": item["task_id"]}, UpdateExpression="REMOVE #rn",
+                ConditionExpression="#rn = :y", ExpressionAttributeNames={"#rn": "run_now"},
+                ExpressionAttributeValues={":y": True},
+            )
+            return True
+        nxt = next_run(item["cron"], item.get("tz") or "UTC")
+        sessions_t.update_item(
+            Key={"task_id": item["task_id"]},
+            UpdateExpression="SET #ne = :ne, #n = :n REMOVE #rn",
+            ConditionExpression="#ne = :old",
+            ExpressionAttributeNames={"#ne": "next_run_epoch", "#n": "next_run", "#rn": "run_now"},
+            ExpressionAttributeValues={":ne": int(nxt.timestamp()), ":n": nxt.isoformat(),
+                                       ":old": item["next_run_epoch"]},
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def fire_schedule(item: dict) -> str:
+    """Send the scheduled message. Returns the session id it went to."""
+    owner = item["submitted_by"]
+    msg = {"id": uuid.uuid4().hex[:12], "text": item["message"], "by": owner, "at": now_iso(),
+           "scheduled": item.get("name") or "schedule"}
+    names = {"#s": "status", "#in": "inbox", "#u": "updated_at", "#pc": "pending_count", "#cr": "close_requested"}
+    if item.get("target") == "session":
+        sid = item["session_id"]
+        sessions_t.update_item(
+            Key={"task_id": sid},
+            UpdateExpression="SET #in = list_append(#in, :m), #u = :t ADD #pc :one",
+            ConditionExpression="#k = :kind AND NOT (#s IN (:closed, :failed)) AND #cr = :f",
+            ExpressionAttributeNames={**names, "#k": "kind"},
+            ExpressionAttributeValues={":m": [msg], ":t": now_iso(), ":one": 1, ":kind": KIND,
+                                       ":closed": "CLOSED", ":failed": "FAILED", ":f": False},
+        )
+        return sid
+    # Fresh session per run; close the previous run's session if it is idle.
+    prev = item.get("last_session_id")
+    if prev:
+        try:
+            sessions_t.update_item(
+                Key={"task_id": prev},
+                UpdateExpression="SET #s = :c, #cr = :y, #u = :t",
+                ConditionExpression="#s = :idle AND #pc = :zero",
+                ExpressionAttributeNames={"#s": "status", "#cr": "close_requested", "#u": "updated_at",
+                                          "#pc": "pending_count"},
+                ExpressionAttributeValues={":c": "CLOSED", ":y": True, ":t": now_iso(), ":idle": "IDLE", ":zero": 0},
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+    sid = uuid.uuid4().hex[:16]
+    now = now_iso()
+    fields: dict[str, Any] = {
+        "kind": KIND, "title": f"⏰ {item.get('name') or 'schedule'}", "mode": item.get("mode") or "unattended",
+        "status": "IDLE", "submitted_by": owner, "worker_id": WORKER_ID, "created_at": now, "updated_at": now,
+        "inbox": [msg], "consumed": 0, "pending_count": 1, "last_seq": 0, "decisions": {},
+        "interrupt_requested": False, "close_requested": False, "schedule_id": item["task_id"].split("#", 1)[1],
+    }
+    for key in ("cwd", "model"):
+        if item.get(key):
+            fields[key] = item[key]
+    # The worker role has UpdateItem (not PutItem) on this table; UpdateItem
+    # creates the item, and the condition makes it create-only.
+    sessions_t.update_item(
+        Key={"task_id": sid},
+        UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in fields),
+        ConditionExpression="attribute_not_exists(task_id)",
+        ExpressionAttributeNames={f"#{k}": k for k in fields},
+        ExpressionAttributeValues={f":{k}": _to_ddb(v) for k, v in fields.items()},
+    )
+    return sid
+
+
+def record_schedule_run(item: dict, sid: str | None, error: str | None, disable: bool = False) -> None:
+    names = {"#lr": "last_run", "#le": "last_error", "#r": "runs"}
+    values: dict[str, Any] = {":lr": now_iso(), ":le": (error or "")[:500], ":one": 1}
+    sets = "#lr = :lr, #le = :le"
+    if sid:
+        names["#ls"] = "last_session_id"
+        values[":ls"] = sid
+        sets += ", #ls = :ls"
+    if disable:
+        names["#e"] = "enabled"  # the target session is gone: stop retrying
+        values[":f"] = False
+        sets += ", #e = :f"
+    sessions_t.update_item(Key={"task_id": item["task_id"]}, UpdateExpression=f"SET {sets} ADD #r :one",
+                           ExpressionAttributeNames=names, ExpressionAttributeValues=values)
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +603,16 @@ class LiveSession:
         self.stream = EventStream(self.sid, int(item.get("last_seq") or 0))
         self.client: ClaudeSDKClient | None = None
         self.last_used = time.monotonic()
+        self.owner: str = item.get("submitted_by") or ""
+        self.title: str = (item.get("title") or "Claude session")[:80]
+
+    def push(self, title: str, body: str) -> None:
+        """Notify the session owner's devices (fire and forget)."""
+        payload = {"title": title, "body": redact(body)[:180], "session_id": self.sid,
+                   "url": f"/claude?session={self.sid}", "tag": f"claude-{self.sid}"}
+        task = asyncio.create_task(asyncio.to_thread(send_push, self.owner, payload))
+        self.worker.background.add(task)
+        task.add_done_callback(self.worker.background.discard)
 
     async def _guard_hook(self, input_data: dict, _tool_use_id: Any, _ctx: Any) -> dict:
         """PreToolUse hook: runs in EVERY permission mode (auto and acceptEdits
@@ -485,6 +697,8 @@ class LiveSession:
         self.open_approvals += 1
         await self.stream.emit("approval_request", tool=tool, input=tool_input, approval_id=approval_id)
         await self.stream.status("WAITING_APPROVAL", f"waiting for approval of {tool}")
+        detail = str(tool_input.get("command") or tool_input.get("file_path") or tool_input.get("url") or "")
+        self.push(f"需要审批：{tool}", f"{self.title}\n{detail}")
         try:
             return await self._wait_decision(tool, tool_input, approval_id)
         finally:
@@ -551,17 +765,9 @@ class LiveSession:
             self.client = None
             log.info("session %s: Claude Code released", self.sid)
 
-    async def run_turn(self, message: dict) -> tuple[str, float | None]:
-        """Run one user turn. Returns (status after the turn, cost)."""
-        self.last_used = time.monotonic()
-        await self.sync_settings(await asyncio.to_thread(get_session, self.sid) or {})
-        attachments = message.get("attachments") or []
-        await self.stream.emit(
-            "user_message", text=message.get("text", ""), by=message.get("by"),
-            attachments=[{"name": a.get("name"), "size": a.get("size")} for a in attachments] or None,
-        )
-        await self.stream.status("RUNNING", None)
+    async def _prompt_for(self, message: dict) -> str:
         prompt = message.get("text", "")
+        attachments = message.get("attachments") or []
         if attachments:
             try:
                 saved = await asyncio.to_thread(download_attachments, self.sid, attachments)
@@ -569,18 +775,50 @@ class LiveSession:
             except Exception as e:  # noqa: BLE001 - tell the user, still run the turn
                 log.exception("session %s: attachment download failed", self.sid)
                 await self.stream.emit("error", message=f"Could not fetch attachments: {type(e).__name__}: {e}")
+        return prompt
+
+    async def _emit_user_message(self, message: dict, steer: bool = False) -> None:
+        attachments = message.get("attachments") or []
+        await self.stream.emit(
+            "user_message", text=message.get("text", ""), by=message.get("by"),
+            attachments=[{"name": a.get("name"), "size": a.get("size")} for a in attachments] or None,
+            steer=True if steer else None, scheduled=message.get("scheduled") or None,
+        )
+
+    async def run_turn(self, message: dict, index: int = 0, can_steer: bool = False) -> tuple[str, float | None, int]:
+        """Run one user turn. Returns (status after the turn, cost, messages steered in).
+
+        Steering (like typing while `claude` works): a message sent during the
+        turn is passed to Claude Code while a tool call is running; Claude
+        reads it when that tool finishes, inside the same turn. Only done when
+        nothing else was queued at the start (so messages keep their order) and
+        only while a tool runs (otherwise Claude Code would start a separate
+        turn we are not reading). A message that is not steered in simply runs
+        as the next turn.
+        """
+        self.last_used = time.monotonic()
+        started = time.monotonic()
+        await self.sync_settings(await asyncio.to_thread(get_session, self.sid) or {})
+        await self._emit_user_message(message)
+        await self.stream.status("RUNNING", None)
+        prompt = await self._prompt_for(message)
 
         interrupted = False
+        failed = False
         cost: float | None = None
         buf: list[str] = []
         last_flush = time.monotonic()
         streamed_text = False
+        steered = 0
+        tools_in_flight: set[str] = set()
+        last_text = ""
 
         async def flush() -> None:
-            nonlocal last_flush
+            nonlocal last_flush, last_text
             if buf:
                 text = "".join(buf)
                 buf.clear()
+                last_text = (last_text + text)[-400:]
                 await self.stream.emit("text", text=text, partial=True)
             last_flush = time.monotonic()
 
@@ -588,7 +826,7 @@ class LiveSession:
             client = await self.ensure_client()
 
             async def watch_interrupt() -> None:
-                nonlocal interrupted
+                nonlocal interrupted, steered
                 while True:
                     await self.worker.wait_control(1)
                     item = await asyncio.to_thread(get_session, self.sid) or {}
@@ -598,6 +836,15 @@ class LiveSession:
                         await self.stream.emit("status", status="RUNNING", message="interrupting…")
                         await client.interrupt()
                         return
+                    inbox = item.get("inbox") or []
+                    while can_steer and tools_in_flight and len(inbox) > index + 1 + steered:
+                        extra = inbox[index + 1 + steered]
+                        if extra.get("scheduled"):  # scheduled prompts get their own turn
+                            break
+                        text = await self._prompt_for(extra)
+                        await client.query(text)
+                        steered += 1
+                        await self._emit_user_message(extra, steer=True)
 
             watcher = asyncio.create_task(watch_interrupt())
             try:
@@ -625,22 +872,29 @@ class LiveSession:
                         await flush()
                         for block in getattr(msg, "content", []) or []:
                             bkind = type(block).__name__
-                            if bkind == "TextBlock" and not streamed_text and getattr(block, "text", ""):
-                                await self.stream.emit("text", text=block.text)
+                            if bkind == "TextBlock" and getattr(block, "text", ""):
+                                last_text = block.text[-400:]
+                                if not streamed_text:
+                                    await self.stream.emit("text", text=block.text)
                             elif bkind == "ToolUseBlock":
+                                if getattr(msg, "parent_tool_use_id", None) is None:
+                                    tools_in_flight.add(getattr(block, "id", "") or uuid.uuid4().hex)
                                 await self.stream.emit("tool_use", tool=block.name, input=block.input)
                         streamed_text = False
                     elif kind == "UserMessage":
                         content = getattr(msg, "content", [])
                         for block in content if isinstance(content, list) else []:
                             if type(block).__name__ == "ToolResultBlock":
+                                tools_in_flight.discard(getattr(block, "tool_use_id", ""))
                                 out = block.content
                                 if isinstance(out, list):
                                     out = "\n".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in out)
                                 await self.stream.emit("tool_result", output=str(out or ""),
                                                        is_error=bool(getattr(block, "is_error", False)))
                     elif kind == "ResultMessage":
+                        tools_in_flight.clear()
                         await flush()
+                        failed = bool(getattr(msg, "is_error", False))
                         cost = getattr(msg, "total_cost_usd", None)
                         sid = getattr(msg, "session_id", None)
                         if sid and sid != self.claude_session_id:
@@ -658,12 +912,19 @@ class LiveSession:
                 await flush()
         except Exception as e:  # noqa: BLE001 - report and drop the client; next turn resumes
             log.exception("session %s: turn failed", self.sid)
-            await self.stream.emit("error", message=f"{type(e).__name__}: {e}")
+            failed = True
+            last_text = f"{type(e).__name__}: {e}"
+            await self.stream.emit("error", message=last_text)
             await self.release()
 
         self.last_used = time.monotonic()
+        # Tell the owner when a long (or scheduled) turn is done; the page
+        # suppresses it if they are already looking at this session.
+        if not interrupted and (message.get("scheduled") or time.monotonic() - started >= PUSH_MIN_TURN_SECONDS):
+            head = "⚠️ 出错" if failed else "✅ 已完成"
+            self.push(f"{head}：{self.title}", last_text.strip().replace("\n", " ")[-160:] or "Claude 回复完毕")
         item = await asyncio.to_thread(get_session, self.sid) or {}
-        return ("CLOSED" if item.get("close_requested") else "IDLE"), cost
+        return ("CLOSED" if item.get("close_requested") else "IDLE"), cost, steered
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +938,9 @@ class Worker:
         self.live: dict[str, LiveSession] = {}
         self.stopping = False
         self.mqtt = None
+        self.background: set[asyncio.Task] = set()
+        self.vapid_public_key: str | None = None
+        self.schedules_checked = 0.0
 
     # ---- IoT wake-ups -------------------------------------------------------
     def _on_publish(self, data: Any) -> None:
@@ -729,7 +993,7 @@ class Worker:
                 if time.monotonic() - scanned_at > 300:
                     projects = await asyncio.to_thread(discover_projects)
                     scanned_at = time.monotonic()
-                await asyncio.to_thread(heartbeat, list(self.live), projects)
+                await asyncio.to_thread(heartbeat, list(self.live), projects, self.vapid_public_key)
             except Exception as e:  # noqa: BLE001
                 log.warning("heartbeat failed: %s", e)
             await asyncio.sleep(HEARTBEAT_SECONDS)
@@ -761,6 +1025,38 @@ class Worker:
             await live.release()
             del self.live[sid]
 
+    async def fire_due_schedules(self, force: bool = False) -> bool:
+        """Send any scheduled prompts that are due. Returns True if one fired."""
+        if not force and time.monotonic() - self.schedules_checked < SCHEDULE_CHECK_SECONDS:
+            return False
+        self.schedules_checked = time.monotonic()
+        fired = False
+        for item in await asyncio.to_thread(due_schedules):
+            try:
+                if not await asyncio.to_thread(claim_schedule, item):
+                    continue
+            except Exception:  # noqa: BLE001 - e.g. a bad cron; skip, keep the worker alive
+                log.exception("schedule %s: claim failed", item.get("task_id"))
+                continue
+            sid, error, disable = None, None, False
+            try:
+                sid = await asyncio.to_thread(fire_schedule, item)
+                fired = True
+                log.info("schedule %s fired into session %s", item["task_id"], sid)
+            except ClientError as e:
+                gone = e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+                error = "Target session has ended; schedule paused" if gone else f"{type(e).__name__}: {e}"
+                disable = gone and item.get("target") == "session"
+            except Exception as e:  # noqa: BLE001
+                error = f"{type(e).__name__}: {e}"
+            if error:
+                log.warning("schedule %s failed: %s", item.get("task_id"), error)
+            try:
+                await asyncio.to_thread(record_schedule_run, item, sid, error, disable)
+            except Exception:  # noqa: BLE001
+                log.exception("schedule %s: could not record run", item.get("task_id"))
+        return fired
+
     async def close_requested_idle(self) -> None:
         for item in await asyncio.to_thread(my_sessions, {"IDLE"}):
             if item.get("close_requested"):
@@ -771,6 +1067,9 @@ class Worker:
         self.loop = asyncio.get_running_loop()
         os.makedirs(WORKDIR, exist_ok=True)
         self.start_mqtt()
+        self.vapid_public_key = await asyncio.to_thread(load_vapid_public_key)
+        if self.vapid_public_key and not PUSH_SUBJECT:
+            log.warning("PUSH_SUBJECT is not set; Web Push notifications are off")
         await self.recover_orphans()
         hb = asyncio.create_task(self.heartbeat_loop())
         log.info("Worker %s ready (workdir=%s, model=%s)", WORKER_ID, WORKDIR, MODEL)
@@ -778,6 +1077,10 @@ class Worker:
             while not self.stopping:
                 ran = False
                 try:
+                    try:
+                        await self.fire_due_schedules(force=self.wake.is_set())
+                    except Exception:  # noqa: BLE001 - schedules must not stop sessions
+                        log.exception("schedule check failed")
                     for item in await asyncio.to_thread(my_sessions, {"IDLE"}, True):
                         if await asyncio.to_thread(claim_turn, item["task_id"]):
                             ran = True
@@ -830,8 +1133,10 @@ class Worker:
         if consumed >= len(inbox):
             await asyncio.to_thread(set_fields, sid, status="IDLE", pending_count=0)
             return
-        status, cost = await live.run_turn(inbox[consumed])
-        await asyncio.to_thread(finish_turn, sid, status, cost)
+        # Steer only if nothing else was already queued behind this message.
+        can_steer = len(inbox) == consumed + 1
+        status, cost, steered = await live.run_turn(inbox[consumed], consumed, can_steer)
+        await asyncio.to_thread(finish_turn, sid, status, cost, steered)
         await live.stream.emit("status", status=status, message=None)
         if status == "CLOSED":
             await live.release()

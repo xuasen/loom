@@ -228,6 +228,7 @@ def _public(item: dict) -> dict:
         "cwd": item.get("cwd"),
         "model": item.get("model"),
         "pending_approvals": sorted((item.get("pending_approvals") or {}).keys()),
+        "schedule_id": item.get("schedule_id"),
         "cost_usd": _plain(item.get("cost_usd")) if item.get("cost_usd") is not None else None,
     }
 
@@ -336,8 +337,13 @@ def get_config(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict
         workers.append({"worker_id": default_worker, "online": False, "last_heartbeat": None, "model": None,
                         "projects": [], "default_cwd": None})
     models, labels = _models_and_labels()
+    # Web Push: the worker sends notifications, so the browser subscribes with
+    # that worker's VAPID public key (published in its heartbeat; not secret).
+    vapid = next((w.get("vapid_public_key") for w in items
+                  if w.get("worker_id") == default_worker and w.get("vapid_public_key")), None) \
+        or next((w.get("vapid_public_key") for w in items if w.get("vapid_public_key")), None)
     return {"enabled": True, "workers": workers, "models": models, "model_labels": labels,
-            "default_model": _default_model(),
+            "default_model": _default_model(), "vapid_public_key": vapid,
             "modes": ["default", "acceptEdits", "plan", "auto", "unattended"]}
 
 
@@ -689,3 +695,267 @@ def close(session_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOP
         )
     logger.info("Claude session %s closed by %s", session_id, user.username)
     _notify(item["worker_id"], "control", {"type": "close", "session_id": session_id})
+
+
+# ---------------------------------------------------------------------------
+# Web Push subscriptions
+# ---------------------------------------------------------------------------
+# The worker posts notifications to the browser's push service, so only the
+# real push services are accepted as endpoints (anything else would let a
+# caller make the worker send requests to an arbitrary URL).
+PUSH_KIND = "push"
+PUSH_HOSTS = re.compile(
+    r"^(fcm\.googleapis\.com|updates\.push\.services\.mozilla\.com|web\.push\.apple\.com|"
+    r"[a-z0-9-]+\.push\.apple\.com|[a-z0-9-]+\.notify\.windows\.com)$"
+)
+MAX_PUSH_SUBSCRIPTIONS_PER_USER = 10
+
+
+def _valid_push_endpoint(endpoint: str) -> bool:
+    from urllib.parse import urlparse
+
+    u = urlparse(endpoint)
+    return u.scheme == "https" and bool(u.hostname) and bool(PUSH_HOSTS.match(u.hostname or "")) and u.port in (None, 443)
+
+
+def _push_key(endpoint: str) -> str:
+    import hashlib
+
+    return "push#" + hashlib.sha256(endpoint.encode()).hexdigest()[:32]
+
+
+class PushKeys(BaseModel):
+    p256dh: str = Field(min_length=16, max_length=200, pattern=r"^[A-Za-z0-9_=-]+$")
+    auth: str = Field(min_length=8, max_length=100, pattern=r"^[A-Za-z0-9_=-]+$")
+
+
+class PushSubscriptionRequest(BaseModel):
+    endpoint: str = Field(min_length=10, max_length=1000)
+    keys: PushKeys
+    user_agent: str | None = Field(default=None, max_length=300)
+
+
+@router.post("/push/subscriptions", status_code=201)
+def subscribe_push(req: PushSubscriptionRequest, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
+    """Register this browser for notifications (approval needed, turn finished)."""
+    _require_enabled()
+    if not _valid_push_endpoint(req.endpoint):
+        raise HTTPException(status_code=400, detail="Not a recognised Web Push endpoint")
+    mine = _sessions().query(
+        IndexName="by_created", KeyConditionExpression=Key("kind").eq(PUSH_KIND),
+        FilterExpression=Attr("submitted_by").eq(user.username) & Attr("enabled").eq(True), Limit=500,
+    ).get("Items", [])
+    key = _push_key(req.endpoint)
+    if len(mine) >= MAX_PUSH_SUBSCRIPTIONS_PER_USER and not any(i["task_id"] == key for i in mine):
+        raise HTTPException(status_code=429, detail=f"At most {MAX_PUSH_SUBSCRIPTIONS_PER_USER} devices per user")
+    _sessions().put_item(Item={
+        "task_id": key, "kind": PUSH_KIND, "created_at": _now_iso(), "submitted_by": user.username,
+        "endpoint": req.endpoint, "keys": {"p256dh": req.keys.p256dh, "auth": req.keys.auth},
+        "user_agent": (req.user_agent or "")[:300], "enabled": True,
+    })
+    logger.info("Push subscription %s registered by %s", key, user.username)
+    return {"subscribed": True}
+
+
+class PushUnsubscribeRequest(BaseModel):
+    endpoint: str = Field(min_length=10, max_length=1000)
+
+
+@router.post("/push/unsubscribe", status_code=204)
+def unsubscribe_push(req: PushUnsubscribeRequest, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> None:
+    _require_enabled()
+    try:
+        _sessions().update_item(
+            Key={"task_id": _push_key(req.endpoint)},
+            UpdateExpression="SET #e = :f",
+            ConditionExpression="#k = :k AND #by = :u",
+            ExpressionAttributeNames={"#e": "enabled", "#k": "kind", "#by": "submitted_by"},
+            ExpressionAttributeValues={":f": False, ":k": PUSH_KIND, ":u": user.username},
+        )
+    except ClientError as e:
+        if not _conditional_failed(e):
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Scheduled prompts (cron)
+# ---------------------------------------------------------------------------
+# A schedule sends a message on a cron. The worker fires it (it already polls
+# DynamoDB), either into an existing session or into a fresh session per run.
+SCHEDULE_KIND = "schedule"
+MAX_SCHEDULES_PER_USER = 20
+MIN_SCHEDULE_INTERVAL_SECONDS = 300
+
+
+def _next_runs(cron: str, tz: str, count: int = 3) -> list[datetime]:
+    from zoneinfo import ZoneInfo
+
+    from croniter import croniter
+
+    try:
+        zone = ZoneInfo(tz)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Unknown time zone: {tz}") from e
+    if not croniter.is_valid(cron) or len(cron.split()) != 5:
+        raise HTTPException(status_code=400, detail="Cron must have 5 fields: minute hour day month weekday")
+    it = croniter(cron, datetime.now(zone))
+    runs = [it.get_next(datetime) for _ in range(max(count, 2))]
+    if (runs[1] - runs[0]).total_seconds() < MIN_SCHEDULE_INTERVAL_SECONDS:
+        raise HTTPException(status_code=400, detail="Schedules may run at most every 5 minutes")
+    return runs[:count]
+
+
+def _public_schedule(item: dict) -> dict:
+    keys = ("name", "cron", "tz", "message", "target", "session_id", "cwd", "model", "mode", "worker_id",
+            "enabled", "next_run", "last_run", "last_session_id", "last_error", "created_at", "submitted_by")
+    out = {k: _plain(item.get(k)) for k in keys}
+    out["schedule_id"] = item["task_id"].split("#", 1)[1]
+    out["runs"] = _plain(item.get("runs") or 0)
+    return out
+
+
+def _get_schedule(schedule_id: str, user: UserInfo) -> dict:
+    if not re.fullmatch(r"[a-f0-9]{12}", schedule_id):
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    item = _sessions().get_item(Key={"task_id": f"sched#{schedule_id}"}, ConsistentRead=True).get("Item")
+    if not item or item.get("kind") != SCHEDULE_KIND or item.get("deleted") or item.get("submitted_by") != user.username:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return item
+
+
+class SchedulePreviewRequest(BaseModel):
+    cron: str = Field(min_length=9, max_length=100)
+    tz: str = Field(default="Asia/Shanghai", max_length=64)
+
+
+@router.post("/schedules/preview")
+def preview_schedule(req: SchedulePreviewRequest, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
+    _require_enabled()
+    return {"next_runs": [r.isoformat() for r in _next_runs(req.cron.strip(), req.tz, 3)]}
+
+
+@router.get("/schedules")
+def list_schedules(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
+    _require_enabled()
+    items = _sessions().query(
+        IndexName="by_created", KeyConditionExpression=Key("kind").eq(SCHEDULE_KIND),
+        FilterExpression=Attr("submitted_by").eq(user.username) & Attr("deleted").ne(True),
+        ScanIndexForward=False, Limit=500,
+    ).get("Items", [])
+    return {"schedules": [_public_schedule(i) for i in items]}
+
+
+class CreateScheduleRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    cron: str = Field(min_length=9, max_length=100)
+    tz: str = Field(default="Asia/Shanghai", max_length=64)
+    message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    # "session": send into session_id each time (context carries over);
+    # "new": open a fresh session per run (the previous idle one is closed).
+    target: Literal["session", "new"] = "new"
+    session_id: str | None = Field(default=None, max_length=32, pattern=r"^[a-f0-9]+$")
+    mode: Mode = "unattended"
+    model: str | None = Field(default=None, max_length=100)
+    worker_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    cwd: str | None = Field(default=None, max_length=300, pattern=r"^/[A-Za-z0-9._/@+-]*$")
+
+
+@router.post("/schedules", status_code=201)
+def create_schedule(req: CreateScheduleRequest, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
+    _require_enabled()
+    if len(list_schedules(user)["schedules"]) >= MAX_SCHEDULES_PER_USER:
+        raise HTTPException(status_code=429, detail=f"At most {MAX_SCHEDULES_PER_USER} schedules per user")
+    cron = " ".join(req.cron.split())
+    first = _next_runs(cron, req.tz, 2)[0]
+    worker_id = req.worker_id or _env("LOOM_CLAUDE_DEFAULT_WORKER", "loom-worker-1")
+    item: dict[str, Any] = {
+        "task_id": f"sched#{uuid.uuid4().hex[:12]}", "kind": SCHEDULE_KIND, "created_at": _now_iso(),
+        "updated_at": _now_iso(), "submitted_by": user.username, "name": req.name, "cron": cron, "tz": req.tz,
+        "message": req.message, "target": req.target, "mode": req.mode, "worker_id": worker_id,
+        "enabled": True, "deleted": False, "runs": 0,
+        "next_run_epoch": int(first.timestamp()), "next_run": first.isoformat(),
+    }
+    if req.target == "session":
+        if not req.session_id:
+            raise HTTPException(status_code=400, detail="session_id is required for target=session")
+        session = _get_item(req.session_id)
+        if session.get("submitted_by") != user.username:
+            raise HTTPException(status_code=403, detail="You can only schedule into your own sessions")
+        if session.get("status") in CLOSED_STATES:
+            raise HTTPException(status_code=409, detail="Session has ended")
+        item["session_id"] = req.session_id
+        item["worker_id"] = session["worker_id"]
+    else:
+        if req.cwd and ".." not in req.cwd.split("/"):
+            item["cwd"] = req.cwd
+        if _validate_model(req.model):
+            item["model"] = req.model
+    _sessions().put_item(Item=item, ConditionExpression="attribute_not_exists(task_id)")
+    logger.info("Claude schedule %s (%s) created by %s", item["task_id"], cron, user.username)
+    return _public_schedule(item)
+
+
+class UpdateScheduleRequest(BaseModel):
+    enabled: bool | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    cron: str | None = Field(default=None, min_length=9, max_length=100)
+    tz: str | None = Field(default=None, max_length=64)
+    message: str | None = Field(default=None, min_length=1, max_length=MAX_MESSAGE_CHARS)
+    mode: Mode | None = None
+
+
+@router.patch("/schedules/{schedule_id}")
+def update_schedule(
+    schedule_id: str, req: UpdateScheduleRequest, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE)),
+) -> dict:
+    _require_enabled()
+    item = _get_schedule(schedule_id, user)
+    fields: dict[str, Any] = {k: v for k, v in req.model_dump().items() if v is not None}
+    if "cron" in fields:
+        fields["cron"] = " ".join(fields["cron"].split())
+    if {"cron", "tz", "enabled"} & fields.keys():
+        first = _next_runs(fields.get("cron", item["cron"]), fields.get("tz", item["tz"]), 2)[0]
+        fields["next_run_epoch"] = int(first.timestamp())
+        fields["next_run"] = first.isoformat()
+        if fields.get("enabled"):
+            fields["last_error"] = ""
+    if not fields:
+        return _public_schedule(item)
+    fields["updated_at"] = _now_iso()
+    resp = _sessions().update_item(
+        Key={"task_id": item["task_id"]},
+        UpdateExpression="SET " + ", ".join(f"#{k} = :{k}" for k in fields),
+        ExpressionAttributeNames={f"#{k}": k for k in fields},
+        ExpressionAttributeValues={f":{k}": v for k, v in fields.items()},
+        ReturnValues="ALL_NEW",
+    )
+    return _public_schedule(resp["Attributes"])
+
+
+@router.post("/schedules/{schedule_id}/run", status_code=202)
+def run_schedule_now(schedule_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
+    """Fire once now (the regular cron timing is kept)."""
+    _require_enabled()
+    item = _get_schedule(schedule_id, user)
+    _sessions().update_item(
+        Key={"task_id": item["task_id"]},
+        UpdateExpression="SET #rn = :y",
+        ExpressionAttributeNames={"#rn": "run_now"},
+        ExpressionAttributeValues={":y": True},
+    )
+    _notify(item["worker_id"], "tasks", {"schedule_id": schedule_id})
+    return {"queued": True}
+
+
+@router.delete("/schedules/{schedule_id}", status_code=204)
+def delete_schedule(schedule_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> None:
+    """Soft delete: the record stays (disabled) for the audit trail."""
+    _require_enabled()
+    item = _get_schedule(schedule_id, user)
+    _sessions().update_item(
+        Key={"task_id": item["task_id"]},
+        UpdateExpression="SET #d = :y, #e = :f, #u = :t",
+        ExpressionAttributeNames={"#d": "deleted", "#e": "enabled", "#u": "updated_at"},
+        ExpressionAttributeValues={":y": True, ":f": False, ":t": _now_iso()},
+    )
+    logger.info("Claude schedule %s deleted by %s", item["task_id"], user.username)

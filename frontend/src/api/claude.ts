@@ -52,6 +52,7 @@ export interface ClaudeSession {
   cwd?: string | null;
   model?: string | null;
   pending_approvals?: string[];
+  schedule_id?: string | null;
 }
 
 export type ClaudeEventType =
@@ -87,6 +88,10 @@ export interface ClaudeEvent {
   mode?: ClaudeSessionMode;
   model?: string;
   attachments?: { name: string; size: number }[];
+  /** user_message sent while a turn ran and passed to Claude mid-turn. */
+  steer?: boolean;
+  /** user_message sent by a schedule (its name). */
+  scheduled?: string;
 }
 
 export interface ClaudeWorker {
@@ -105,6 +110,124 @@ export interface ClaudeConfig {
   model_labels?: Record<string, string>;
   default_model?: string;
   modes: ClaudeSessionMode[];
+  /** VAPID public key of the worker that sends notifications (null = push unavailable). */
+  vapid_public_key?: string | null;
+}
+
+// ---- Web Push --------------------------------------------------------------
+
+export function pushSupported(): boolean {
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+
+function b64urlToBytes(b64: string): Uint8Array {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function swRegistration(): Promise<ServiceWorkerRegistration> {
+  const existing = await navigator.serviceWorker.getRegistration("/");
+  return existing ?? navigator.serviceWorker.register("/sw.js", { scope: "/" });
+}
+
+/** Current subscription of this browser, if it was made with this key. */
+export async function currentPushSubscription(vapidKey: string): Promise<PushSubscription | null> {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.getRegistration("/");
+  const sub = await reg?.pushManager.getSubscription();
+  if (!sub) return null;
+  const key = sub.options.applicationServerKey;
+  if (key && btoa(String.fromCharCode(...new Uint8Array(key))) !== btoa(String.fromCharCode(...b64urlToBytes(vapidKey)))) {
+    return null; // made with another worker key: treat as not subscribed
+  }
+  return sub;
+}
+
+export async function enablePush(vapidKey: string): Promise<void> {
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") throw new Error("Notifications were not allowed in this browser");
+  const reg = await swRegistration();
+  await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && !(await currentPushSubscription(vapidKey))) {
+    await sub.unsubscribe();
+    sub = null;
+  }
+  sub ??= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64urlToBytes(vapidKey) });
+  const json = sub.toJSON() as { endpoint: string; keys: { p256dh: string; auth: string } };
+  await apiFetch("/api/claude/push/subscriptions", {
+    method: "POST",
+    body: JSON.stringify({ endpoint: json.endpoint, keys: json.keys, user_agent: navigator.userAgent.slice(0, 300) }),
+  });
+}
+
+export async function disablePush(): Promise<void> {
+  const reg = await navigator.serviceWorker.getRegistration("/");
+  const sub = await reg?.pushManager.getSubscription();
+  if (!sub) return;
+  await apiFetch<void>("/api/claude/push/unsubscribe", { method: "POST", body: JSON.stringify({ endpoint: sub.endpoint }) });
+  await sub.unsubscribe();
+}
+
+// ---- Schedules ---------------------------------------------------------------
+
+export interface ClaudeSchedule {
+  schedule_id: string;
+  name: string;
+  cron: string;
+  tz: string;
+  message: string;
+  target: "session" | "new";
+  session_id?: string | null;
+  cwd?: string | null;
+  model?: string | null;
+  mode: ClaudeSessionMode;
+  enabled: boolean;
+  next_run?: string | null;
+  last_run?: string | null;
+  last_session_id?: string | null;
+  last_error?: string | null;
+  runs: number;
+}
+
+export interface NewSchedule {
+  name: string;
+  cron: string;
+  tz: string;
+  message: string;
+  target: "session" | "new";
+  session_id?: string;
+  mode: ClaudeSessionMode;
+  model?: string;
+  cwd?: string;
+}
+
+export function listClaudeSchedules(): Promise<{ schedules: ClaudeSchedule[] }> {
+  return apiFetch("/api/claude/schedules");
+}
+
+export function previewClaudeSchedule(cron: string, tz: string): Promise<{ next_runs: string[] }> {
+  return apiFetch("/api/claude/schedules/preview", { method: "POST", body: JSON.stringify({ cron, tz }) });
+}
+
+export function createClaudeSchedule(body: NewSchedule): Promise<ClaudeSchedule> {
+  return apiFetch("/api/claude/schedules", { method: "POST", body: JSON.stringify(body) });
+}
+
+export function updateClaudeSchedule(
+  id: string,
+  body: Partial<Pick<ClaudeSchedule, "enabled" | "name" | "cron" | "tz" | "message" | "mode">>,
+): Promise<ClaudeSchedule> {
+  return apiFetch(`/api/claude/schedules/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+export function runClaudeScheduleNow(id: string): Promise<{ queued: boolean }> {
+  return apiFetch(`/api/claude/schedules/${encodeURIComponent(id)}/run`, { method: "POST" });
+}
+
+export function deleteClaudeSchedule(id: string): Promise<void> {
+  return apiFetch<void>(`/api/claude/schedules/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export interface SessionStateFrame {
