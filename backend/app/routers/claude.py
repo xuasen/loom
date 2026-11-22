@@ -584,9 +584,14 @@ def decide(
         _sessions().update_item(
             Key={"task_id": session_id},
             UpdateExpression="SET #d.#a = :d",
-            ConditionExpression="attribute_exists(#pa.#a) AND attribute_not_exists(#d.#a)",
-            ExpressionAttributeNames={"#d": "decisions", "#a": approval_id, "#pa": "pending_approvals"},
-            ExpressionAttributeValues={":d": {"decision": req.decision, "by": user.username, "at": _now_iso()}},
+            # Workers that predate pending_approvals never write it: fall back
+            # to the session-level WAITING_APPROVAL check for those.
+            ConditionExpression="attribute_not_exists(#d.#a) AND "
+                                "(attribute_exists(#pa.#a) OR (attribute_not_exists(#pa) AND #s = :waiting))",
+            ExpressionAttributeNames={"#d": "decisions", "#a": approval_id, "#pa": "pending_approvals",
+                                      "#s": "status"},
+            ExpressionAttributeValues={":d": {"decision": req.decision, "by": user.username, "at": _now_iso()},
+                                       ":waiting": "WAITING_APPROVAL"},
         )
     except ClientError as e:
         if _conditional_failed(e):
