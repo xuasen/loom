@@ -520,6 +520,7 @@ def fire_schedule(item: dict) -> str:
         "status": "IDLE", "submitted_by": owner, "worker_id": WORKER_ID, "created_at": now, "updated_at": now,
         "inbox": [msg], "consumed": 0, "pending_count": 1, "last_seq": 0, "decisions": {},
         "interrupt_requested": False, "close_requested": False, "schedule_id": item["task_id"].split("#", 1)[1],
+        "folder": "定时任务",
     }
     for key in ("cwd", "model"):
         if item.get(key):

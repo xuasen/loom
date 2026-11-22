@@ -53,6 +53,8 @@ export interface ClaudeSession {
   model?: string | null;
   pending_approvals?: string[];
   schedule_id?: string | null;
+  /** "" = ungrouped; "/" separates nested folders. */
+  folder?: string;
 }
 
 export type ClaudeEventType =
@@ -256,6 +258,7 @@ export function createClaudeSession(body: {
   cwd?: string;
   model?: string;
   attachments?: string[];
+  folder?: string;
 }): Promise<ClaudeSession> {
   return apiFetch<ClaudeSession>("/api/claude/sessions", { method: "POST", body: JSON.stringify(body) });
 }
@@ -326,6 +329,10 @@ export function updateClaudeSettings(
 
 export function interruptClaudeSession(id: string): Promise<void> {
   return apiFetch<void>(path(id, "/interrupt"), { method: "POST" });
+}
+
+export function setClaudeSessionFolder(id: string, folder: string): Promise<ClaudeSession> {
+  return apiFetch<ClaudeSession>(path(id, "/folder"), { method: "POST", body: JSON.stringify({ folder }) });
 }
 
 export function deleteClaudeSession(id: string): Promise<void> {

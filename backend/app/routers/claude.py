@@ -229,6 +229,7 @@ def _public(item: dict) -> dict:
         "model": item.get("model"),
         "pending_approvals": sorted((item.get("pending_approvals") or {}).keys()),
         "schedule_id": item.get("schedule_id"),
+        "folder": item.get("folder") or "",
         "cost_usd": _plain(item.get("cost_usd")) if item.get("cost_usd") is not None else None,
     }
 
@@ -387,11 +388,38 @@ def list_sessions(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> d
     resp = _sessions().query(
         IndexName="by_created",
         KeyConditionExpression=Key("kind").eq(KIND),
-        FilterExpression=Attr("deleted").ne(True),
+        # Only the caller's own sessions (scheduled runs count: the caller made
+        # the schedule); deleted ones and other people's/test rows are hidden.
+        FilterExpression=Attr("deleted").ne(True) & Attr("submitted_by").eq(user.username),
         ScanIndexForward=False,
-        Limit=200,
+        Limit=500,
     )
-    return {"sessions": [_public(i) for i in resp.get("Items", [])][:100]}
+    return {"sessions": [_public(i) for i in resp.get("Items", [])][:200]}
+
+
+class FolderRequest(BaseModel):
+    # "" or null = ungrouped. "/" separates nested folders, e.g. "altitude/ios".
+    folder: str | None = Field(default=None, max_length=120, pattern=r"^[^\x00-\x1f]*$")
+
+
+@router.post("/sessions/{session_id}/folder")
+def set_session_folder(
+    session_id: str, req: FolderRequest, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE)),
+) -> dict:
+    """Put a session into a folder (folders exist as long as a session uses them)."""
+    _require_enabled()
+    item = _get_item(session_id)
+    if item.get("submitted_by") != user.username:
+        raise HTTPException(status_code=403, detail="Only the session owner can move it")
+    folder = "/".join(p.strip() for p in (req.folder or "").split("/") if p.strip())
+    resp = _sessions().update_item(
+        Key={"task_id": session_id},
+        UpdateExpression="SET #f = :f",
+        ExpressionAttributeNames={"#f": "folder"},
+        ExpressionAttributeValues={":f": folder},
+        ReturnValues="ALL_NEW",
+    )
+    return _public(resp["Attributes"])
 
 
 class CreateSessionRequest(BaseModel):
@@ -403,6 +431,7 @@ class CreateSessionRequest(BaseModel):
     # Project directory on the worker (like `cd <dir> && claude`). The worker
     # re-validates it (must be under its user's home, not a secret location).
     cwd: str | None = Field(default=None, max_length=300, pattern=r"^/[A-Za-z0-9._/@+-]*$")
+    folder: str | None = Field(default=None, max_length=120, pattern=r"^[^\x00-\x1f]*$")
 
 
 @router.post("/sessions", status_code=201)
@@ -446,6 +475,9 @@ def create_session(req: CreateSessionRequest, user: UserInfo = Depends(require_s
         item["cwd"] = req.cwd
     if _validate_model(req.model):
         item["model"] = req.model
+    folder = "/".join(p.strip() for p in (req.folder or "").split("/") if p.strip())
+    if folder:
+        item["folder"] = folder
     _sessions().put_item(Item=item, ConditionExpression="attribute_not_exists(task_id)")
     logger.info("Claude session %s opened by %s on %s (mode=%s)", session_id, user.username, worker_id, req.mode)
     _notify(worker_id, "tasks", {"session_id": session_id})

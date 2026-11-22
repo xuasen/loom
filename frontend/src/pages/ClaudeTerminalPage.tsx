@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle, ArrowDown, Bell, BellOff, Check, ChevronLeft, ChevronRight, Clock, CornerDownRight, FileText,
-  Folder, Loader2, Paperclip, Plus, RefreshCw, Send, Shield, Sparkles, Square, SquareTerminal, Trash2, X, XCircle,
+  AlertTriangle, ArrowDown, Bell, BellOff, Check, ChevronDown, ChevronLeft, ChevronRight, Clock, CornerDownRight,
+  FileText, Folder, FolderInput, FolderPlus, GripHorizontal, Loader2, Maximize2, Minimize2, Paperclip, Plus, RefreshCw, Send, Shield, Sparkles, Square, SquareTerminal, Trash2, X, XCircle,
 } from "lucide-react";
 import { ClaudeSchedulesPanel } from "@/components/ClaudeSchedulesPanel";
 import { toast } from "sonner";
@@ -27,6 +27,7 @@ import {
   modelLabel,
   pushSupported,
   sendClaudeMessage,
+  setClaudeSessionFolder,
   streamClaudeEvents,
   updateClaudeSettings,
   uploadClaudeFile,
@@ -402,6 +403,18 @@ export function ClaudeTerminalPage() {
   const [files, setFiles] = useState<PendingFile[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [showSchedules, setShowSchedules] = useState(false);
+  // Folder the next new session goes into; collapsed folders persist per browser.
+  const [newFolder, setNewFolder] = useState("");
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem("loom_claude_collapsed") || "[]") as string[]);
+    } catch {
+      return new Set();
+    }
+  });
+  // Composer height: null = grow with the text (up to ~8 lines); a number = dragged/maximised.
+  const [composerHeight, setComposerHeight] = useState<number | null>(null);
+  const dragRef = useRef<{ startY: number; startH: number } | null>(null);
   const [pushOn, setPushOn] = useState(false);
   const [pushBusy, setPushBusy] = useState(false);
 
@@ -542,16 +555,25 @@ export function ClaudeTerminalPage() {
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
+    if (composerHeight !== null) {
+      el.style.height = `${composerHeight}px`;
+      return;
+    }
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-  }, [input]);
+  }, [input, composerHeight]);
 
-  const openSession = (id: string | null) => {
+  const maxComposer = () => Math.round(window.innerHeight * 0.7);
+  const toggleComposerSize = () =>
+    setComposerHeight((h) => (h !== null && h >= window.innerHeight * 0.45 ? null : Math.round(window.innerHeight * 0.5)));
+
+  const openSession = (id: string | null, folderForNew?: string) => {
     setSelectedId(id);
     setShowConversation(true);
     stickRef.current = true;
     setShowJump(false);
     if (!id) {
+      setNewFolder(folderForNew ?? "");
       setMode("default");
       setCwd("");
       const initial = config?.default_model ?? models[0];
@@ -584,6 +606,7 @@ export function ClaudeTerminalPage() {
       if (!selectedId) {
         const s = await createClaudeSession({
           message: text, mode, model: model || undefined, cwd: cwd || undefined, attachments,
+          folder: newFolder || undefined,
         });
         setSessions((prev) => [s, ...prev]);
         setSelectedId(s.session_id);
@@ -637,6 +660,52 @@ export function ClaudeTerminalPage() {
     } catch (e) {
       toast.error(`Could not end session: ${(e as Error).message}`);
     }
+  };
+
+  const folders = useMemo(
+    () => Array.from(new Set(sessions.map((s) => s.folder || "").filter(Boolean))).sort((a, b) => a.localeCompare(b)),
+    [sessions],
+  );
+
+  // Ungrouped first, then folders alphabetically (sub-folders follow their parent).
+  const groups = useMemo(() => {
+    const by = new Map<string, ClaudeSession[]>();
+    for (const x of sessions) {
+      const f = x.folder || "";
+      by.set(f, [...(by.get(f) ?? []), x]);
+    }
+    return [...by.entries()].sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
+  }, [sessions]);
+
+  const toggleFolder = (f: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(f)) next.delete(f);
+      else next.add(f);
+      localStorage.setItem("loom_claude_collapsed", JSON.stringify([...next]));
+      return next;
+    });
+
+  const moveToFolder = async (choice: string) => {
+    if (!selectedId) return;
+    let folder = choice;
+    if (choice === "__new__") {
+      const name = window.prompt("New folder name (use / for sub-folders, e.g. altitude/ios)");
+      if (!name?.trim()) return;
+      folder = name.trim();
+    }
+    try {
+      const s = await setClaudeSessionFolder(selectedId, folder);
+      setSelected(s);
+      setSessions((prev) => prev.map((x) => (x.session_id === s.session_id ? { ...x, folder: s.folder } : x)));
+    } catch (e) {
+      toast.error(`Could not move: ${(e as Error).message}`);
+    }
+  };
+
+  const newFolderSession = () => {
+    const name = window.prompt("Folder for the new session (use / for sub-folders)");
+    if (name?.trim()) openSession(null, name.trim());
   };
 
   const deleteSession = async () => {
@@ -729,6 +798,9 @@ export function ClaudeTerminalPage() {
           <Button size="icon-sm" variant="ghost" onClick={() => void refreshSessions()} aria-label="Refresh">
             <RefreshCw className="h-4 w-4" />
           </Button>
+          <Button size="icon-sm" variant="ghost" onClick={newFolderSession} aria-label="New folder" title="New session in a new folder">
+            <FolderPlus className="h-4 w-4" />
+          </Button>
           <Button size="icon-sm" onClick={() => openSession(null)} aria-label="New session">
             <Plus className="h-4 w-4" />
           </Button>
@@ -751,26 +823,62 @@ export function ClaudeTerminalPage() {
             </div>
           </div>
         )}
-        {sessions.map((s) => (
-          <button
-            key={s.session_id}
-            type="button"
-            onClick={() => openSession(s.session_id)}
-            className={`w-full rounded-lg px-3 py-3 text-left transition-colors md:py-2.5 ${
-              s.session_id === selectedId ? "bg-accent" : "hover:bg-accent/50 active:bg-accent"
-            }`}
-          >
-            <div className="flex items-center gap-2">
-              <span className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[s.status]}`} />
-              <span className="min-w-0 flex-1 truncate text-sm font-medium">{s.title || "Untitled"}</span>
-              <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground md:hidden" />
+        {groups.map(([folder, list]) => {
+          const isCollapsed = collapsed.has(folder);
+          const depth = folder ? folder.split("/").length - 1 : 0;
+          return (
+            <div key={folder || "__none__"} className="mb-1">
+              {folder && (
+                <div className="group flex items-center" style={{ paddingLeft: depth * 12 }}>
+                  <button
+                    type="button"
+                    onClick={() => toggleFolder(folder)}
+                    className="flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-accent/50"
+                  >
+                    {isCollapsed ? <ChevronRight className="h-3.5 w-3.5 shrink-0" /> : <ChevronDown className="h-3.5 w-3.5 shrink-0" />}
+                    <Folder className="h-3.5 w-3.5 shrink-0" />
+                    <span className="truncate">{folder.split("/").pop()}</span>
+                    <span className="ml-auto shrink-0 opacity-60">{list.length}</span>
+                  </button>
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    className="h-7 w-7 opacity-100 md:opacity-0 md:group-hover:opacity-100"
+                    onClick={() => openSession(null, folder)}
+                    aria-label={`New session in ${folder}`}
+                    title={`New session in ${folder}`}
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              )}
+              {!isCollapsed && (
+                <div style={{ paddingLeft: folder ? depth * 12 + 10 : 0 }}>
+                  {list.map((s) => (
+              <button
+                key={s.session_id}
+                type="button"
+                onClick={() => openSession(s.session_id)}
+                className={`w-full rounded-lg px-3 py-3 text-left transition-colors md:py-2.5 ${
+                  s.session_id === selectedId ? "bg-accent" : "hover:bg-accent/50 active:bg-accent"
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[s.status]}`} />
+                  <span className="min-w-0 flex-1 truncate text-sm font-medium">{s.title || "Untitled"}</span>
+                  <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground md:hidden" />
+                </div>
+                <div className="mt-0.5 pl-4 text-xs text-muted-foreground truncate">
+                  {STATUS_LABEL[s.status]} · {relativeTime(s.updated_at ?? s.created_at)} · {s.turns} turns
+                  {s.cwd ? ` · ${shortPath(s.cwd)}` : ""}
+                </div>
+              </button>
+                  ))}
+                </div>
+              )}
             </div>
-            <div className="mt-0.5 pl-4 text-xs text-muted-foreground truncate">
-              {STATUS_LABEL[s.status]} · {relativeTime(s.updated_at ?? s.created_at)} · {s.turns} turns
-              {s.cwd ? ` · ${shortPath(s.cwd)}` : ""}
-            </div>
-          </button>
-        ))}
+          );
+        })}
       </div>
     </aside>
   );
@@ -800,6 +908,19 @@ export function ClaudeTerminalPage() {
           </div>
         )}
       </div>
+      {selectedId && selected && (
+        <PillSelect
+          icon={<FolderInput className="h-3.5 w-3.5 shrink-0" />}
+          value={selected.folder || ""}
+          options={[
+            { value: "", label: "No folder" },
+            ...folders.map((f) => ({ value: f, label: f })),
+            { value: "__new__", label: "New folder…" },
+          ]}
+          onChange={(v) => void moveToFolder(v)}
+          label="Move to folder"
+        />
+      )}
       {selectedId && !isClosed && (
         <Button size="sm" variant="ghost" onClick={() => void endSession()} className="text-muted-foreground">
           <XCircle className="h-4 w-4" />
@@ -844,6 +965,11 @@ export function ClaudeTerminalPage() {
                 Pick a project — it runs like <code className="font-mono">cd &lt;project&gt; &amp;&amp; claude</code>, with
                 that project's CLAUDE.md, skills, MCP servers and memory.
               </p>
+              {newFolder && (
+                <div className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-accent px-3 py-1 text-xs">
+                  <Folder className="h-3.5 w-3.5" /> {newFolder}
+                </div>
+              )}
               <div className="mt-5 flex justify-center">
                 <PillSelect
                   icon={<Folder className="h-3.5 w-3.5 shrink-0" />}
@@ -989,7 +1115,30 @@ export function ClaudeTerminalPage() {
           </div>
         )}
 
-        <div className="rounded-2xl border bg-card shadow-sm focus-within:ring-2 focus-within:ring-ring/40">
+        <div className="relative rounded-2xl border bg-card shadow-sm focus-within:ring-2 focus-within:ring-ring/40">
+          {/* Drag to resize the input (double-click resets it). */}
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize input"
+            title="Drag to resize · double-click to reset"
+            className="absolute -top-2.5 left-1/2 flex h-5 w-16 -translate-x-1/2 cursor-ns-resize touch-none items-center justify-center rounded-full border bg-background text-muted-foreground hover:text-foreground"
+            onPointerDown={(e) => {
+              e.currentTarget.setPointerCapture(e.pointerId);
+              dragRef.current = { startY: e.clientY, startH: inputRef.current?.offsetHeight ?? 44 };
+            }}
+            onPointerMove={(e) => {
+              const d = dragRef.current;
+              if (!d) return;
+              setComposerHeight(Math.max(44, Math.min(maxComposer(), d.startH + (d.startY - e.clientY))));
+            }}
+            onPointerUp={() => {
+              dragRef.current = null;
+            }}
+            onDoubleClick={() => setComposerHeight(null)}
+          >
+            <GripHorizontal className="h-3.5 w-3.5" />
+          </div>
           <textarea
             ref={inputRef}
             value={input}
@@ -1021,7 +1170,9 @@ export function ClaudeTerminalPage() {
                   ? "Reply to Claude…"
                   : "What should Claude do?"
             }
-            className="block max-h-[200px] w-full resize-none bg-transparent px-3.5 pt-3 pb-1 text-base outline-none placeholder:text-muted-foreground md:text-sm"
+            className={`block w-full resize-none bg-transparent px-3.5 pt-3 pb-1 text-base outline-none placeholder:text-muted-foreground md:text-sm ${
+              composerHeight === null ? "max-h-[200px]" : "max-h-[70dvh]"
+            }`}
           />
           <div className="flex items-center gap-1.5 px-2 pb-2">
             <input
@@ -1042,6 +1193,20 @@ export function ClaudeTerminalPage() {
               aria-label="Attach files"
             >
               <Paperclip className="h-4 w-4" />
+            </Button>
+            <Button
+              size="icon-sm"
+              variant="ghost"
+              className="h-8 w-8 shrink-0 rounded-full"
+              onClick={toggleComposerSize}
+              aria-label={composerHeight !== null && composerHeight >= window.innerHeight * 0.45 ? "Shrink input" : "Enlarge input"}
+              title="Enlarge / shrink the input"
+            >
+              {composerHeight !== null && composerHeight >= window.innerHeight * 0.45 ? (
+                <Minimize2 className="h-4 w-4" />
+              ) : (
+                <Maximize2 className="h-4 w-4" />
+              )}
             </Button>
             <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto">
               <PillSelect
