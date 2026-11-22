@@ -28,6 +28,7 @@ export interface ClaudeSession {
   pending_count: number;
   turns: number;
   cost_usd?: number | null;
+  cwd?: string | null;
 }
 
 export type ClaudeEventType =
@@ -65,6 +66,8 @@ export interface ClaudeWorker {
   online: boolean;
   last_heartbeat?: string | null;
   model?: string | null;
+  projects?: string[];
+  default_cwd?: string | null;
 }
 
 export interface ClaudeConfig {
@@ -95,6 +98,7 @@ export function createClaudeSession(body: {
   message: string;
   mode: ClaudeSessionMode;
   worker_id?: string;
+  cwd?: string;
 }): Promise<ClaudeSession> {
   return apiFetch<ClaudeSession>("/api/claude/sessions", { method: "POST", body: JSON.stringify(body) });
 }

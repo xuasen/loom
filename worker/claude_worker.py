@@ -45,6 +45,15 @@ TASKS_TABLE = os.environ.get("TASKS_TABLE", "loom-claude-tasks")
 EVENTS_TABLE = os.environ.get("EVENTS_TABLE", "loom-claude-events")
 WORKERS_TABLE = os.environ.get("WORKERS_TABLE", "loom-claude-workers")
 WORKDIR = os.path.realpath(os.path.expanduser(os.environ.get("WORKDIR", "~/work")))
+HOME = os.path.realpath(os.path.expanduser("~"))
+# Where to look for projects the UI can open a session in (colon-separated).
+PROJECT_ROOTS = [os.path.realpath(os.path.expanduser(p))
+                 for p in os.environ.get("PROJECT_ROOTS", "~").split(":") if p]
+PROJECT_MARKERS = (".git", "CLAUDE.md", ".claude", ".mcp.json")
+PROJECT_SCAN_SKIP = {"node_modules", "venv", ".venv", "__pycache__", "dist", "build", "work"}
+# MCP tools allowed without a human in unattended mode (regex on the tool name,
+# e.g. "^mcp__analytics__"). Empty = none.
+UNATTENDED_MCP_ALLOW = re.compile(os.environ["UNATTENDED_MCP_ALLOW"]) if os.environ.get("UNATTENDED_MCP_ALLOW") else None
 MODEL = os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-sonnet-4-6")
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
 APPROVAL_TIMEOUT_S = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", "1800"))
@@ -68,7 +77,11 @@ workers_t = ddb.Table(WORKERS_TABLE)
 # ---------------------------------------------------------------------------
 # Tool policy
 # ---------------------------------------------------------------------------
-READ_ONLY_TOOLS = {"Read", "Glob", "Grep", "LS", "TodoWrite", "NotebookRead"}
+# Allowed without asking: read-only tools, loading a skill's instructions,
+# MCP resource reads, and launching subagents (their own tool calls still go
+# through this same policy).
+READ_ONLY_TOOLS = {"Read", "Glob", "Grep", "LS", "TodoWrite", "NotebookRead", "Skill",
+                   "ListMcpResourcesTool", "ReadMcpResourceTool", "Task", "Agent"}
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 NETWORK_TOOLS = {"WebFetch", "WebSearch"}
 
@@ -103,17 +116,17 @@ def redact(text: str) -> str:
     return text
 
 
-def _paths_in(tool_input: dict) -> list[str]:
+def _paths_in(tool_input: dict, base: str) -> list[str]:
     out = []
     for key in ("file_path", "path", "notebook_path"):
         value = tool_input.get(key)
         if isinstance(value, str) and value:
-            out.append(os.path.realpath(os.path.join(WORKDIR, os.path.expanduser(value))))
+            out.append(os.path.realpath(os.path.join(base, os.path.expanduser(value))))
     return out
 
 
-def hard_deny_reason(tool: str, tool_input: dict) -> str | None:
-    for p in _paths_in(tool_input):
+def hard_deny_reason(tool: str, tool_input: dict, base: str) -> str | None:
+    for p in _paths_in(tool_input, base):
         if SENSITIVE_PATH.search(p):
             return f"Access to {p} is blocked (credential/secret location)"
     if tool == "Bash" and BASH_HARD_DENY.search(str(tool_input.get("command", ""))):
@@ -121,19 +134,53 @@ def hard_deny_reason(tool: str, tool_input: dict) -> str | None:
     return None
 
 
-def unattended_allowed(tool: str, tool_input: dict) -> tuple[bool, str]:
+def unattended_allowed(tool: str, tool_input: dict, base: str) -> tuple[bool, str]:
     if tool in EDIT_TOOLS:
-        paths = _paths_in(tool_input)
-        if paths and all(p == WORKDIR or p.startswith(WORKDIR + os.sep) for p in paths):
+        paths = _paths_in(tool_input, base)
+        if paths and all(p == base or p.startswith(base + os.sep) for p in paths):
             return True, ""
-        return False, f"Unattended edits are limited to {WORKDIR}"
+        return False, f"Unattended edits are limited to {base}"
     if tool == "Bash":
         if BASH_UNATTENDED_DENY.search(str(tool_input.get("command", ""))):
             return False, "Command not allowed in unattended mode (network, publish, privilege or destructive)"
         return True, ""
     if tool in NETWORK_TOOLS:
         return False, "Web access is not allowed in unattended mode"
+    if tool.startswith("mcp__") and UNATTENDED_MCP_ALLOW and UNATTENDED_MCP_ALLOW.search(tool):
+        return True, ""
     return False, f"Tool {tool} is not on the unattended allowlist"
+
+
+def discover_projects() -> list[str]:
+    """Directories (≤2 levels under PROJECT_ROOTS) that look like projects."""
+    found: set[str] = {WORKDIR}
+    for root in PROJECT_ROOTS:
+        frontier = [(root, 0)]
+        while frontier and len(found) < 60:
+            path, depth = frontier.pop()
+            try:
+                entries = list(os.scandir(path))
+            except OSError:
+                continue
+            if path != HOME and any(e.name in PROJECT_MARKERS for e in entries):
+                found.add(os.path.realpath(path))
+            if depth < 2:
+                for e in entries:
+                    if e.is_dir(follow_symlinks=False) and not e.name.startswith(".") \
+                            and e.name not in PROJECT_SCAN_SKIP:
+                        frontier.append((e.path, depth + 1))
+    return sorted(found)
+
+
+def resolve_cwd(requested: str | None) -> str:
+    """Session directory: a project under $HOME (never a secret location)."""
+    if not requested:
+        return WORKDIR
+    real = os.path.realpath(os.path.expanduser(requested))
+    if (real == HOME or real.startswith(HOME + os.sep)) and os.path.isdir(real) and not SENSITIVE_PATH.search(real):
+        return real
+    log.warning("rejected session cwd %r; using %s", requested, WORKDIR)
+    return WORKDIR
 
 
 # ---------------------------------------------------------------------------
@@ -223,13 +270,15 @@ def finish_turn(sid: str, status: str, cost: float | None) -> None:
     )
 
 
-def heartbeat(active: list[str]) -> None:
+def heartbeat(active: list[str], projects: list[str]) -> None:
     workers_t.put_item(Item={
         "worker_id": WORKER_ID,
         "last_heartbeat": now_iso(),
         "last_heartbeat_epoch": Decimal(str(round(time.time(), 1))),
         "live_sessions": active,
         "model": MODEL,
+        "projects": projects,
+        "default_cwd": WORKDIR,
     })
 
 
@@ -276,19 +325,20 @@ class LiveSession:
         self.sid: str = item["task_id"]
         self.mode: str = item.get("mode", "interactive")
         self.claude_session_id: str | None = item.get("claude_session_id") or None
+        self.cwd = resolve_cwd(item.get("cwd"))
         self.stream = EventStream(self.sid, int(item.get("last_seq") or 0))
         self.client: ClaudeSDKClient | None = None
         self.last_used = time.monotonic()
 
     async def _can_use_tool(self, tool: str, tool_input: dict, _ctx: Any):
-        reason = hard_deny_reason(tool, tool_input)
+        reason = hard_deny_reason(tool, tool_input, self.cwd)
         if reason:
             await self.stream.emit("error", message=f"Blocked {tool}: {reason}")
             return PermissionResultDeny(message=reason, interrupt=False)
         if tool in READ_ONLY_TOOLS:
             return PermissionResultAllow(updated_input=tool_input)
         if self.mode == "unattended":
-            ok, why = unattended_allowed(tool, tool_input)
+            ok, why = unattended_allowed(tool, tool_input, self.cwd)
             if ok:
                 return PermissionResultAllow(updated_input=tool_input)
             await self.stream.emit("error", message=f"Denied {tool}: {why}")
@@ -319,18 +369,25 @@ class LiveSession:
 
     async def ensure_client(self) -> ClaudeSDKClient:
         if self.client is None:
+            # Behave like `claude` started in the project directory: Claude
+            # Code's own system prompt (the SDK's default is a bare prompt),
+            # user/project/local settings, CLAUDE.md, skills, .mcp.json and the
+            # per-project memory under ~/.claude/projects/<cwd>.
             options = ClaudeAgentOptions(
-                cwd=WORKDIR,
+                cwd=self.cwd,
                 model=MODEL,
                 max_turns=MAX_TURNS,
                 resume=self.claude_session_id,
                 can_use_tool=self._can_use_tool,
                 include_partial_messages=True,
+                system_prompt={"type": "preset", "preset": "claude_code"},
+                setting_sources=["user", "project", "local"],
             )
             client = ClaudeSDKClient(options=options)
             await client.connect()
             self.client = client
-            log.info("session %s: Claude Code %s", self.sid, "resumed" if self.claude_session_id else "started")
+            log.info("session %s: Claude Code %s in %s", self.sid,
+                     "resumed" if self.claude_session_id else "started", self.cwd)
         return self.client
 
     async def release(self) -> None:
@@ -499,9 +556,14 @@ class Worker:
 
     # ---- housekeeping ---------------------------------------------------------
     async def heartbeat_loop(self) -> None:
+        projects: list[str] = []
+        scanned_at = 0.0
         while not self.stopping:
             try:
-                await asyncio.to_thread(heartbeat, list(self.live))
+                if time.monotonic() - scanned_at > 300:
+                    projects = await asyncio.to_thread(discover_projects)
+                    scanned_at = time.monotonic()
+                await asyncio.to_thread(heartbeat, list(self.live), projects)
             except Exception as e:  # noqa: BLE001
                 log.warning("heartbeat failed: %s", e)
             await asyncio.sleep(HEARTBEAT_SECONDS)

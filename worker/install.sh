@@ -52,6 +52,9 @@ Wants=network-online.target
 User=$RUN_USER
 Group=$RUN_USER
 EnvironmentFile=$ENV_FILE
+# Optional, owned by $RUN_USER: variables your tools/skills expect from your
+# shell (what \`claude\` in a terminal inherits from ~/.bashrc). KEY=value lines.
+EnvironmentFile=-$RUN_HOME/.config/loom-claude-worker/env
 WorkingDirectory=$WORKDIR
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/claude_worker.py
 Restart=always

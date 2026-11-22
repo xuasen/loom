@@ -245,6 +245,7 @@ export function ClaudeTerminalPage() {
   const [selected, setSelected] = useState<ClaudeSession | null>(null);
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<ClaudeSessionMode>("interactive");
+  const [cwd, setCwd] = useState<string>("");
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const stickRef = useRef(true);
@@ -314,7 +315,7 @@ export function ClaudeTerminalPage() {
     setSending(true);
     try {
       if (!selectedId) {
-        const s = await createClaudeSession({ message: text, mode });
+        const s = await createClaudeSession({ message: text, mode, cwd: cwd || undefined });
         setSessions((prev) => [s, ...prev]);
         setSelectedId(s.session_id);
       } else {
@@ -456,6 +457,7 @@ export function ClaudeTerminalPage() {
                       </span>
                     )}
                     {selected && <span>{selected.mode}</span>}
+                    {selected?.cwd && <span className="font-mono truncate">{selected.cwd}</span>}
                   </div>
                 )}
               </div>
@@ -484,7 +486,27 @@ export function ClaudeTerminalPage() {
               >
                 {!selectedId && (
                   <div className="text-sm text-muted-foreground space-y-3">
-                    <p>Start a conversation. Claude Code runs in the worker's work directory.</p>
+                    <p>
+                      Start a conversation. Pick the project to run in — like <code>cd &lt;project&gt; &amp;&amp; claude</code>,
+                      so its CLAUDE.md, skills, MCP servers and memory load.
+                    </p>
+                    <label className="flex items-center gap-2 text-xs">
+                      Project
+                      <select
+                        value={cwd}
+                        onChange={(e) => setCwd(e.target.value)}
+                        className="h-8 min-w-[18rem] rounded-md border bg-background px-2 font-mono text-xs"
+                      >
+                        <option value="">{worker?.default_cwd ?? "default work directory"}</option>
+                        {(worker?.projects ?? [])
+                          .filter((p) => p !== worker?.default_cwd)
+                          .map((p) => (
+                            <option key={p} value={p}>
+                              {p}
+                            </option>
+                          ))}
+                      </select>
+                    </label>
                     <div className="flex items-center gap-4 text-xs">
                       <label className="flex items-center gap-1">
                         <input type="radio" checked={mode === "interactive"} onChange={() => setMode("interactive")} />

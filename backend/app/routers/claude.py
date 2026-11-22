@@ -131,6 +131,7 @@ def _public(item: dict) -> dict:
         "last_seq": _plain(item.get("last_seq") or 0),
         "pending_count": _plain(item.get("pending_count") or 0),
         "turns": _plain(item.get("consumed") or 0),
+        "cwd": item.get("cwd"),
         "cost_usd": _plain(item.get("cost_usd")) if item.get("cost_usd") is not None else None,
     }
 
@@ -181,10 +182,13 @@ def get_config(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict
         "online": now - float(w.get("last_heartbeat_epoch") or 0) < WORKER_ONLINE_SECONDS,
         "last_heartbeat": w.get("last_heartbeat"),
         "model": w.get("model"),
+        "projects": list(w.get("projects") or []),
+        "default_cwd": w.get("default_cwd"),
     } for w in items]
     default_worker = _env("LOOM_CLAUDE_DEFAULT_WORKER", "loom-worker-1")
     if not any(w["worker_id"] == default_worker for w in workers):
-        workers.append({"worker_id": default_worker, "online": False, "last_heartbeat": None, "model": None})
+        workers.append({"worker_id": default_worker, "online": False, "last_heartbeat": None, "model": None,
+                        "projects": [], "default_cwd": None})
     return {"enabled": True, "workers": workers}
 
 
@@ -204,6 +208,9 @@ class CreateSessionRequest(BaseModel):
     message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     mode: Literal["interactive", "unattended"] = "interactive"
     worker_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    # Project directory on the worker (like `cd <dir> && claude`). The worker
+    # re-validates it (must be under its user's home, not a secret location).
+    cwd: str | None = Field(default=None, max_length=300, pattern=r"^/[A-Za-z0-9._/@+-]*$")
 
 
 @router.post("/sessions", status_code=201)
@@ -243,6 +250,8 @@ def create_session(req: CreateSessionRequest, user: UserInfo = Depends(require_s
         "interrupt_requested": False,
         "close_requested": False,
     }
+    if req.cwd and ".." not in req.cwd.split("/"):
+        item["cwd"] = req.cwd
     _sessions().put_item(Item=item, ConditionExpression="attribute_not_exists(task_id)")
     logger.info("Claude session %s opened by %s on %s (mode=%s)", session_id, user.username, worker_id, req.mode)
     _notify(worker_id, "tasks", {"session_id": session_id})
