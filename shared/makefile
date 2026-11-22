@@ -1,6 +1,8 @@
 include etc/environment.sh
 # Demo users: pairs demo-user-N/demo-admin-N for N = 1..count (0 = none)
 P_COGNITO_DEMO_USER_COUNT ?= 9
+# security-admin, integration-admin, test-user
+P_COGNITO_SAMPLE_USERS ?= true
 DEMO_NS = $(wordlist 1,$(P_COGNITO_DEMO_USER_COUNT),1 2 3 4 5 6 7 8 9)
 
 # Guardrail stack defaults (issue #17) — used when etc/environment.sh predates
@@ -114,6 +116,7 @@ cognito.deploy:
 		--parameter-overrides \
 			pPoolName=$(P_COGNITO_POOL_NAME) \
 			pDemoUserCount=$(P_COGNITO_DEMO_USER_COUNT) \
+			pCreateSampleUsers=$(P_COGNITO_SAMPLE_USERS) \
 			pDomain=$(P_COGNITO_DOMAIN) \
 			pResourceServerIdentifier=$(P_COGNITO_RESOURCE_SERVER) \
 			pScopes=$(P_COGNITO_SCOPES) \
@@ -134,9 +137,9 @@ cognito.delete:
 # cognito user management
 cognito.set-passwords:
 	aws cognito-idp admin-set-user-password --profile $(PROFILE) --region $(REGION) --user-pool-id $(O_COGNITO_USER_POOL_ID) --username admin --password '$(P_COGNITO_PERMANENT_PASSWORD)' --permanent
-	aws cognito-idp admin-set-user-password --profile $(PROFILE) --region $(REGION) --user-pool-id $(O_COGNITO_USER_POOL_ID) --username security-admin --password '$(P_COGNITO_PERMANENT_PASSWORD)' --permanent
-	aws cognito-idp admin-set-user-password --profile $(PROFILE) --region $(REGION) --user-pool-id $(O_COGNITO_USER_POOL_ID) --username integration-admin --password '$(P_COGNITO_PERMANENT_PASSWORD)' --permanent
-	aws cognito-idp admin-set-user-password --profile $(PROFILE) --region $(REGION) --user-pool-id $(O_COGNITO_USER_POOL_ID) --username test-user --password '$(P_COGNITO_PERMANENT_PASSWORD)' --permanent
+	$(if $(filter true,$(P_COGNITO_SAMPLE_USERS)),aws cognito-idp admin-set-user-password --profile $(PROFILE) --region $(REGION) --user-pool-id $(O_COGNITO_USER_POOL_ID) --username security-admin --password '$(P_COGNITO_PERMANENT_PASSWORD)' --permanent,)
+	$(if $(filter true,$(P_COGNITO_SAMPLE_USERS)),aws cognito-idp admin-set-user-password --profile $(PROFILE) --region $(REGION) --user-pool-id $(O_COGNITO_USER_POOL_ID) --username integration-admin --password '$(P_COGNITO_PERMANENT_PASSWORD)' --permanent,)
+	$(if $(filter true,$(P_COGNITO_SAMPLE_USERS)),aws cognito-idp admin-set-user-password --profile $(PROFILE) --region $(REGION) --user-pool-id $(O_COGNITO_USER_POOL_ID) --username test-user --password '$(P_COGNITO_PERMANENT_PASSWORD)' --permanent,)
 	$(foreach n,$(DEMO_NS),aws cognito-idp admin-set-user-password --profile $(PROFILE) --region $(REGION) --user-pool-id $(O_COGNITO_USER_POOL_ID) --username demo-user-$(n) --password '$(P_COGNITO_DEMO_USER_$(n)_PASSWORD)' --permanent && aws cognito-idp admin-set-user-password --profile $(PROFILE) --region $(REGION) --user-pool-id $(O_COGNITO_USER_POOL_ID) --username demo-admin-$(n) --password '$(P_COGNITO_DEMO_USER_$(n)_PASSWORD)' --permanent && ) true
 
 cognito.get-client-id:

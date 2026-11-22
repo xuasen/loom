@@ -3,6 +3,11 @@ Transform: AWS::Serverless-2016-10-31
 Description: Cognito User Pool for Bedrock AgentCore agent authorization
 
 Parameters:
+  pCreateSampleUsers:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Create the sample accounts security-admin, integration-admin and test-user
   pDemoUserCount:
     Type: Number
     Default: 9
@@ -38,6 +43,7 @@ Parameters:
     Description: Value for the loom:owner tag
 
 Conditions:
+  HasSampleUsers: !Equals [!Ref pCreateSampleUsers, "true"]
   HasDemo1: !Not [!Equals [!Ref pDemoUserCount, 0]]
   HasDemo2: !And [!Condition HasDemo1, !Not [!Equals [!Ref pDemoUserCount, 1]]]
   HasDemo3: !And [!Condition HasDemo2, !Not [!Equals [!Ref pDemoUserCount, 2]]]
@@ -311,6 +317,7 @@ Resources:
           Value: demo-admin-9@heeki.cloud
 
   SecurityAdminUser:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -320,6 +327,7 @@ Resources:
           Value: security-admin@heeki.cloud
 
   IntegrationAdminUser:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -419,6 +427,7 @@ Resources:
           Value: demo-user-9@heeki.cloud
 
   TestUser:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -590,6 +599,7 @@ Resources:
 
   # Security-admin user: t-admin + g-admins-security
   SecurityAdminToTypeAdmin:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -597,6 +607,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   SecurityAdminToGroupAdminsSecurity:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -605,6 +616,7 @@ Resources:
 
   # Integration-admin user: t-admin + g-admins-memory + g-admins-mcp + g-admins-a2a
   IntegrationAdminToTypeAdmin:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -612,6 +624,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   IntegrationAdminToGroupAdminsMemory:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -619,6 +632,7 @@ Resources:
       GroupName: !Ref GroupAdminsMemoryGroup
 
   IntegrationAdminToGroupAdminsMcp:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -626,6 +640,7 @@ Resources:
       GroupName: !Ref GroupAdminsMcpGroup
 
   IntegrationAdminToGroupAdminsA2a:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -779,6 +794,7 @@ Resources:
 
   # Test user: t-user + g-users-test
   TestUserToTypeUser:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -786,6 +802,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   TestUserToGroupUsersTest:
+    Condition: HasSampleUsers
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
