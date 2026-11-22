@@ -227,10 +227,12 @@ function EventRow({
   event,
   open,
   onDecide,
+  labels,
 }: {
   event: ClaudeEvent;
   open: boolean;
   onDecide: (approvalId: string, decision: "allow" | "deny") => void;
+  labels?: Record<string, string>;
 }) {
   switch (event.type) {
     case "tool_use":
@@ -295,7 +297,7 @@ function EventRow({
     case "model":
       return (
         <div className="text-center text-[11px] text-muted-foreground">
-          — {event.model ? modelLabel(event.model) : event.message} —
+          — {event.model ? modelLabel(event.model, labels) : event.message} —
         </div>
       );
     case "status":
@@ -417,7 +419,8 @@ export function ClaudeTerminalPage() {
     getClaudeConfig()
       .then((cfg) => {
         setConfig(cfg);
-        if (cfg.models[0]) setModel((m) => m || cfg.models[0]!);
+        const initial = cfg.default_model ?? cfg.models[0];
+        if (initial) setModel((m) => m || initial);
         if (cfg.enabled) void refreshSessions();
       })
       .catch((e: unknown) => {
@@ -486,7 +489,8 @@ export function ClaudeTerminalPage() {
     if (!id) {
       setMode("default");
       setCwd("");
-      if (models[0]) setModel(models[0]);
+      const initial = config?.default_model ?? models[0];
+      if (initial) setModel(initial);
     }
   };
 
@@ -590,7 +594,7 @@ export function ClaudeTerminalPage() {
   }, [isBusy, interrupt]);
 
   const modeOptions = (config?.modes ?? MODE_CYCLE).map((m) => ({ value: m, label: MODE_LABELS[m] }));
-  const modelOptions = models.map((m) => ({ value: m, label: modelLabel(m) }));
+  const modelOptions = models.map((m) => ({ value: m, label: modelLabel(m, config?.model_labels) }));
   const projectOptions = [
     { value: "", label: shortPath(worker?.default_cwd) || "Default work dir" },
     ...(worker?.projects ?? [])
@@ -775,6 +779,7 @@ export function ClaudeTerminalPage() {
                 event={b.event}
                 open={!!b.event.approval_id && openApprovals.has(b.event.approval_id) && !isClosed}
                 onDecide={(id, d) => void decide(id, d)}
+                labels={config.model_labels}
               />
             ),
           )}

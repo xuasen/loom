@@ -56,7 +56,7 @@ PROJECT_SCAN_SKIP = {"node_modules", "venv", ".venv", "__pycache__", "dist", "bu
 # MCP tools allowed without a human in unattended mode (regex on the tool name,
 # e.g. "^mcp__analytics__"). Empty = none.
 UNATTENDED_MCP_ALLOW = re.compile(os.environ["UNATTENDED_MCP_ALLOW"]) if os.environ.get("UNATTENDED_MCP_ALLOW") else None
-MODEL = os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-sonnet-4-6")
+MODEL = os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-sonnet-5-5")
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
 APPROVAL_TIMEOUT_S = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", "1800"))
 EVENT_TTL_DAYS = int(os.environ.get("EVENT_TTL_DAYS", "365"))

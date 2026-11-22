@@ -24,9 +24,14 @@ export const MODE_LABELS: Record<ClaudeSessionMode, string> = {
 /** The order Shift+Tab cycles through, like the CLI. */
 export const MODE_CYCLE: ClaudeSessionMode[] = ["default", "acceptEdits", "plan", "auto"];
 
-export function modelLabel(id: string): string {
-  const m = id.match(/claude-([a-z]+)-(\d+)-(\d+)/);
-  return m ? `${m[1]![0]!.toUpperCase()}${m[1]!.slice(1)} ${m[2]}.${m[3]}` : id;
+/** "us.anthropic.claude-sonnet-5-5" -> "Sonnet 5.5"; "…claude-opus-5" -> "Opus 5". */
+export function modelLabel(id: string, labels?: Record<string, string>): string {
+  const known = labels?.[id];
+  if (known) return known;
+  const m = id.match(/claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?![\d])/);
+  if (!m) return id;
+  const family = `${m[1]![0]!.toUpperCase()}${m[1]!.slice(1)}`;
+  return m[3] ? `${family} ${m[2]}.${m[3]}` : `${family} ${m[2]}`;
 }
 
 export const CLOSED_STATUSES: ReadonlySet<ClaudeSessionStatus> = new Set(["CLOSED", "FAILED"]);
@@ -97,6 +102,8 @@ export interface ClaudeConfig {
   enabled: boolean;
   workers: ClaudeWorker[];
   models: string[];
+  model_labels?: Record<string, string>;
+  default_model?: string;
   modes: ClaudeSessionMode[];
 }
 

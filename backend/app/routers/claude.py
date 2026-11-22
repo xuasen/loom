@@ -51,18 +51,86 @@ KIND = "session"
 # Loom's "unattended" (deny anything off the worker's allowlist instead of
 # asking). bypassPermissions is deliberately not offered.
 Mode = Literal["default", "acceptEdits", "plan", "auto", "unattended"]
-DEFAULT_MODELS = [
+# Used only if Bedrock cannot be listed.
+FALLBACK_MODELS = [
+    "us.anthropic.claude-sonnet-5-5",
+    "us.anthropic.claude-opus-5-5",
+    "us.anthropic.claude-haiku-5-5",
     "us.anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-opus-4-8",
-    "us.anthropic.claude-opus-4-7",
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 ]
+_FAMILY_ORDER = {"opus": 0, "sonnet": 1, "fable": 2, "haiku": 3}
+_MODEL_RE = re.compile(r"claude-([a-z]+)-(\d+)(?:-(\d+))?")
+_MODELS_TTL = 600
+_models_cache: tuple[float, list[str], dict[str, str]] | None = None
+
+
+def _model_sort_key(model_id: str) -> tuple:
+    m = _MODEL_RE.search(model_id)
+    if not m:
+        return (0, 0, 9, model_id)
+    family, major, minor = m.group(1), int(m.group(2)), int(m.group(3) or 0)
+    # newest version first; within a version Opus, Sonnet, Fable, Haiku
+    return (-major, -(minor if minor < 100 else 0), _FAMILY_ORDER.get(family, 8), model_id)
+
+
+def _list_bedrock_models() -> tuple[list[str], dict[str, str]]:
+    """Active US cross-region Claude inference profiles (Claude 4 and later)."""
+    client = boto3.client("bedrock", region_name=_region())
+    ids: list[str] = []
+    labels: dict[str, str] = {}
+    token = None
+    while True:
+        kwargs: dict[str, Any] = {"maxResults": 1000, "typeEquals": "SYSTEM_DEFINED"}
+        if token:
+            kwargs["nextToken"] = token
+        resp = client.list_inference_profiles(**kwargs)
+        for p in resp.get("inferenceProfileSummaries", []):
+            pid = p.get("inferenceProfileId", "")
+            if p.get("status") != "ACTIVE" or not pid.startswith("us.anthropic.claude-"):
+                continue
+            m = _MODEL_RE.search(pid)
+            if not m or int(m.group(2)) < 4:  # skip Claude 3.x
+                continue
+            ids.append(pid)
+            name = (p.get("inferenceProfileName") or pid).replace("US Anthropic ", "").replace("US ", "")
+            labels[pid] = name.replace("Claude ", "")
+        token = resp.get("nextToken")
+        if not token:
+            break
+    ids.sort(key=_model_sort_key)
+    return ids, labels
+
+
+def _models_and_labels() -> tuple[list[str], dict[str, str]]:
+    global _models_cache
+    raw = _env("LOOM_CLAUDE_MODELS")
+    if raw:  # explicit allowlist wins
+        ids = [m.strip() for m in raw.split(",") if m.strip()]
+        return ids, {}
+    now = time.time()
+    if _models_cache and now - _models_cache[0] < _MODELS_TTL:
+        return _models_cache[1], _models_cache[2]
+    try:
+        ids, labels = _list_bedrock_models()
+        if ids:
+            _models_cache = (now, ids, labels)
+            return ids, labels
+    except Exception as e:  # noqa: BLE001 - fall back to a static list
+        logger.warning("Could not list Bedrock inference profiles: %s", e)
+    return FALLBACK_MODELS, {}
 
 
 def _models() -> list[str]:
-    raw = _env("LOOM_CLAUDE_MODELS")
-    models = [m.strip() for m in raw.split(",") if m.strip()] if raw else DEFAULT_MODELS
-    return models
+    return _models_and_labels()[0]
+
+
+def _default_model() -> str:
+    ids = _models()
+    preferred = _env("LOOM_CLAUDE_DEFAULT_MODEL")
+    if preferred in ids:
+        return preferred
+    # newest Sonnet is the usual default (balanced speed/quality), else the first
+    return next((m for m in ids if "-sonnet-" in m), ids[0] if ids else FALLBACK_MODELS[0])
 
 
 def _validate_model(model: str | None) -> str | None:
@@ -267,7 +335,9 @@ def get_config(user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict
     if not any(w["worker_id"] == default_worker for w in workers):
         workers.append({"worker_id": default_worker, "online": False, "last_heartbeat": None, "model": None,
                         "projects": [], "default_cwd": None})
-    return {"enabled": True, "workers": workers, "models": _models(),
+    models, labels = _models_and_labels()
+    return {"enabled": True, "workers": workers, "models": models, "model_labels": labels,
+            "default_model": _default_model(),
             "modes": ["default", "acceptEdits", "plan", "auto", "unattended"]}
 
 
