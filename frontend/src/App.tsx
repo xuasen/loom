@@ -29,6 +29,7 @@ import { MemoryManagementPage } from "@/pages/MemoryManagementPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { IntegrationsPage } from "@/pages/IntegrationsPage";
 import { SkillsPage } from "@/pages/SkillsPage";
+import { ClaudeTerminalPage } from "@/pages/ClaudeTerminalPage";
 import type { SessionResponse, InvocationResponse } from "@/api/types";
 import { getRegistryConfig } from "@/api/settings";
 import { listRegistryRecords } from "@/api/registry";
@@ -37,7 +38,7 @@ import { listMcpServers } from "@/api/mcp";
 import { listA2aAgents } from "@/api/a2a";
 import { AuthProvider, useAuth, GROUP_SCOPES, type Scope } from "@/contexts/AuthContext";
 import { LoginPage } from "@/pages/LoginPage";
-import { BookOpen, Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle } from "lucide-react";
+import { BookOpen, Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, SquareTerminal } from "lucide-react";
 import { AdminDashboardPage } from "./pages/AdminDashboardPage";
 import { ChatPage } from "./pages/ChatPage";
 import { OAuthLinkCallbackPage } from "./pages/OAuthLinkCallbackPage";
@@ -69,7 +70,7 @@ import { recordPageView, sendBeaconPageView, trackAction } from "./api/audit";
 //     registry:write (unchanged from the standalone Registry page's gate)
 //   - Settings > Models > Guardrails card: visible to anyone on Settings;
 //     editable iff admin:write (PUT /api/settings/guardrail-default's scope)
-type Persona = "catalog" | "security" | "builder" | "memory" | "integrations" | "skills" | "settings" | "admin";
+type Persona = "catalog" | "security" | "builder" | "memory" | "integrations" | "skills" | "settings" | "admin" | "claude";
 
 const USER_GROUPS: Record<string, string[]> = {
   "admin": ["t-admin", "g-admins-super"],
@@ -582,6 +583,14 @@ function AppContent() {
                 count={skillsCount}
               />
             )}
+            {effectiveHasScope("admin:write") && (
+              <SidebarItem
+                icon={SquareTerminal}
+                label={t("nav.claudeTerminal")}
+                active={activePersona === "claude"}
+                onClick={() => setActivePersona("claude")}
+              />
+            )}
           </SidebarSection>
           <SidebarSection label={t("nav.sections.operate")}>
             {(effectiveHasScope("security:read") || effectiveHasScope("security:write")) && (
@@ -630,6 +639,15 @@ function AppContent() {
               </Tooltip>
             </TooltipProvider>
           )}
+          <SidebarItem
+            icon={LogOut}
+            label={t("common.signOut")}
+            active={false}
+            onClick={() => {
+              if (user && browserSessionId) trackAction(user.username ?? user.sub, browserSessionId, "auth", "logout");
+              logout();
+            }}
+          />
           {isAdmin && (
             <div className="px-3 py-1">
               <Select value={viewAsUser ?? "admin"} onValueChange={(v) => setViewAsUser(v === "admin" ? null : v)}>
@@ -833,6 +851,8 @@ function AppContent() {
           {activePersona === "skills" && (
             <SkillsPage key={`skill-${pendingSkillId ?? "none"}`} initialSelectedId={pendingSkillId} />
           )}
+          {activePersona === "claude" && effectiveHasScope("admin:write") && <ClaudeTerminalPage />}
+
           {activePersona === "settings" && (
             <SettingsPage
               canViewTagging={effectiveHasScope("tagging:read")}

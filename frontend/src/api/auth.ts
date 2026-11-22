@@ -167,6 +167,26 @@ export async function refreshTokens(
   return response.json() as Promise<CognitoAuthResult>;
 }
 
+/**
+ * Revoke a Cognito refresh token (and the access/id tokens issued from it).
+ * Sent with keepalive so it still completes when the page reloads right after.
+ */
+export async function revokeToken(
+  refreshToken: string,
+  clientId: string,
+  region: string,
+): Promise<void> {
+  await fetch(`https://cognito-idp.${region}.amazonaws.com/`, {
+    method: "POST",
+    keepalive: true,
+    headers: {
+      "Content-Type": "application/x-amz-json-1.1",
+      "X-Amz-Target": "AWSCognitoIdentityProviderService.RevokeToken",
+    },
+    body: JSON.stringify({ ClientId: clientId, Token: refreshToken }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // OIDC Authorization Code + PKCE helpers
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ import {
   initiateAuth,
   respondToNewPasswordChallenge,
   refreshTokens,
+  revokeToken,
   exchangeOIDCCode,
   startOIDCLogin,
   type AuthConfig,
@@ -118,9 +119,14 @@ interface AuthContextValue {
     username: string,
     newPassword: string,
   ) => Promise<void>;
-  logout: () => void;
+  logout: (options?: LogoutOptions) => void;
   logoutIdP: () => void;
   browserSessionId: string | null;
+}
+
+interface LogoutOptions {
+  /** Reload the app after clearing the session (default true). */
+  reload?: boolean;
 }
 
 const ALL_SCOPES = new Set<Scope>([
@@ -531,19 +537,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [config, processAuthResult],
   );
 
-  const logout = useCallback(() => {
+  const logout = useCallback((options?: LogoutOptions) => {
+    const reload = options?.reload ?? true;
+    const refreshToken = tokensRef.current?.refreshToken;
+    const currentConfig = configRef.current;
+
+    // Revoke server-side so the refresh token cannot mint new sessions after
+    // sign-out (clearing browser storage alone leaves it valid for 30 days).
+    // Never block sign-out on it: the request is fire-and-forget + keepalive.
+    if (refreshToken && currentConfig && !isExternalOIDC(currentConfig)) {
+      revokeToken(
+        refreshToken,
+        import.meta.env.VITE_COGNITO_USER_CLIENT_ID,
+        currentConfig.region,
+      ).catch(() => {});
+    }
+
+    if (refreshTimerRef.current) {
+      clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = null;
+    }
     setTokens(null);
     setUser(null);
     setAuthToken(null);
     setBrowserSessionId(null);
     sessionStorage.removeItem("loom_auth_tokens");
     sessionStorage.removeItem("loom_auth_user");
-    if (refreshTimerRef.current) {
-      clearTimeout(refreshTimerRef.current);
-    }
     Object.keys(sessionStorage)
       .filter((k) => k.startsWith("loom:invokePrompt:"))
       .forEach((k) => sessionStorage.removeItem(k));
+
+    if (reload) {
+      // A full reload drops every in-memory request, timer and socket, so no
+      // stale 401/refresh loop can keep the UI stuck in a half-signed-in state.
+      window.location.replace("/");
+      return;
+    }
     setIsLoading(true);
     fetchAuthConfig().then((cfg) => {
       setConfig(cfg);
@@ -554,7 +583,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logoutIdP = useCallback(() => {
     const currentConfig = configRef.current;
     const idToken = tokens?.idToken;
-    logout();
+    // No reload here: this function navigates to the IdP's logout URL itself.
+    logout({ reload: false });
     // Mark that next login should force a fresh prompt
     sessionStorage.setItem("oidc_force_prompt", "login");
     if (currentConfig && isExternalOIDC(currentConfig) && currentConfig.issuer_url && idToken) {
