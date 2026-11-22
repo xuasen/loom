@@ -271,9 +271,10 @@ def send_message(
     try:
         resp = _sessions().update_item(
             Key={"task_id": session_id},
-            UpdateExpression="SET inbox = list_append(inbox, :m), updated_at = :t ADD pending_count :one",
-            ConditionExpression="NOT (#s IN (:closed, :failed)) AND close_requested = :f AND size(inbox) < :max",
-            ExpressionAttributeNames={"#s": "status"},
+            UpdateExpression="SET #in = list_append(#in, :m), #u = :t ADD #pc :one",
+            ConditionExpression="NOT (#s IN (:closed, :failed)) AND #cr = :f AND size(#in) < :max",
+            ExpressionAttributeNames={"#s": "status", "#in": "inbox", "#u": "updated_at",
+                                      "#pc": "pending_count", "#cr": "close_requested"},
             ExpressionAttributeValues={
                 ":m": [_message(req.message, user)], ":t": _now_iso(), ":one": 1,
                 ":closed": "CLOSED", ":failed": "FAILED", ":f": False, ":max": MAX_INBOX,
@@ -381,9 +382,9 @@ def decide(
     try:
         _sessions().update_item(
             Key={"task_id": session_id},
-            UpdateExpression="SET decisions.#a = :d",
-            ConditionExpression="#s = :waiting AND attribute_not_exists(decisions.#a)",
-            ExpressionAttributeNames={"#a": approval_id, "#s": "status"},
+            UpdateExpression="SET #d.#a = :d",
+            ConditionExpression="#s = :waiting AND attribute_not_exists(#d.#a)",
+            ExpressionAttributeNames={"#d": "decisions", "#a": approval_id, "#s": "status"},
             ExpressionAttributeValues={
                 ":d": {"decision": req.decision, "by": user.username, "at": _now_iso()},
                 ":waiting": "WAITING_APPROVAL",
@@ -406,7 +407,8 @@ def interrupt(session_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_
         return
     _sessions().update_item(
         Key={"task_id": session_id},
-        UpdateExpression="SET interrupt_requested = :y, interrupt_by = :u",
+        UpdateExpression="SET #ir = :y, #ib = :u",
+        ExpressionAttributeNames={"#ir": "interrupt_requested", "#ib": "interrupt_by"},
         ExpressionAttributeValues={":y": True, ":u": user.username},
     )
     logger.info("Claude session %s interrupt requested by %s", session_id, user.username)
@@ -423,9 +425,10 @@ def close(session_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOP
     try:
         _sessions().update_item(
             Key={"task_id": session_id},
-            UpdateExpression="SET #s = :c, close_requested = :y, updated_at = :t",
-            ConditionExpression="#s = :idle AND pending_count = :zero",
-            ExpressionAttributeNames={"#s": "status"},
+            UpdateExpression="SET #s = :c, #cr = :y, #u = :t",
+            ConditionExpression="#s = :idle AND #pc = :zero",
+            ExpressionAttributeNames={"#s": "status", "#cr": "close_requested", "#u": "updated_at",
+                                      "#pc": "pending_count"},
             ExpressionAttributeValues={":c": "CLOSED", ":y": True, ":t": _now_iso(), ":idle": "IDLE", ":zero": 0},
         )
     except ClientError as e:
@@ -434,7 +437,8 @@ def close(session_id: str, user: UserInfo = Depends(require_scopes(REQUIRED_SCOP
         # A turn is running or queued: ask the worker to stop and close.
         _sessions().update_item(
             Key={"task_id": session_id},
-            UpdateExpression="SET close_requested = :y, interrupt_requested = :y",
+            UpdateExpression="SET #cr = :y, #ir = :y",
+            ExpressionAttributeNames={"#cr": "close_requested", "#ir": "interrupt_requested"},
             ExpressionAttributeValues={":y": True},
         )
     logger.info("Claude session %s closed by %s", session_id, user.username)

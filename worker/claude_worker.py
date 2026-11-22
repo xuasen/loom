@@ -189,12 +189,15 @@ def my_sessions(statuses: set[str], pending_only: bool = False) -> list[dict]:
 
 
 def claim_turn(sid: str) -> bool:
+    # Every attribute name goes through a placeholder: several of ours
+    # (status, consumed, ...) are DynamoDB reserved words.
     try:
         sessions_t.update_item(
             Key={"task_id": sid},
-            UpdateExpression="SET #s = :r, interrupt_requested = :f",
-            ConditionExpression="#s = :idle AND pending_count > :zero AND worker_id = :w AND close_requested = :f",
-            ExpressionAttributeNames={"#s": "status"},
+            UpdateExpression="SET #s = :r, #ir = :f",
+            ConditionExpression="#s = :idle AND #pc > :zero AND #w = :w AND #cr = :f",
+            ExpressionAttributeNames={"#s": "status", "#ir": "interrupt_requested", "#pc": "pending_count",
+                                      "#w": "worker_id", "#cr": "close_requested"},
             ExpressionAttributeValues={":r": "RUNNING", ":idle": "IDLE", ":zero": 0, ":w": WORKER_ID, ":f": False},
         )
         return True
@@ -205,15 +208,18 @@ def claim_turn(sid: str) -> bool:
 
 
 def finish_turn(sid: str, status: str, cost: float | None) -> None:
-    expr = "SET #s = :s, updated_at = :t, interrupt_requested = :f, consumed = consumed + :one ADD pending_count :neg"
+    names = {"#s": "status", "#u": "updated_at", "#ir": "interrupt_requested", "#c": "consumed",
+             "#pc": "pending_count"}
     values: dict[str, Any] = {":s": status, ":t": now_iso(), ":f": False, ":one": 1, ":neg": -1}
+    sets = "#s = :s, #u = :t, #ir = :f, #c = #c + :one"
     if cost is not None:
-        expr = expr.replace(" ADD ", ", cost_usd = if_not_exists(cost_usd, :zero) + :c ADD ")
-        values[":c"] = Decimal(str(cost))
+        names["#cost"] = "cost_usd"
+        sets += ", #cost = if_not_exists(#cost, :zero) + :cv"
+        values[":cv"] = Decimal(str(cost))
         values[":zero"] = Decimal("0")
     sessions_t.update_item(
-        Key={"task_id": sid}, UpdateExpression=expr,
-        ExpressionAttributeNames={"#s": "status"}, ExpressionAttributeValues=values,
+        Key={"task_id": sid}, UpdateExpression=f"SET {sets} ADD #pc :neg",
+        ExpressionAttributeNames=names, ExpressionAttributeValues=values,
     )
 
 
@@ -503,11 +509,16 @@ class Worker:
     async def recover_orphans(self) -> None:
         """A turn cut off by a restart is reported and skipped (not re-run)."""
         for item in await asyncio.to_thread(my_sessions, {"RUNNING", "WAITING_APPROVAL"}):
-            stream = EventStream(item["task_id"], int(item.get("last_seq") or 0))
-            await stream.emit("error", message="Worker restarted during this turn; it was stopped. "
-                                               "Send a message to continue the conversation.")
-            await asyncio.to_thread(finish_turn, item["task_id"], "IDLE", None)
-            await stream.emit("status", status="IDLE", message=None)
+            sid = item["task_id"]
+            try:
+                stream = EventStream(sid, int(item.get("last_seq") or 0))
+                await stream.emit("error", message="Worker restarted during this turn; it was stopped. "
+                                                   "Send a message to continue the conversation.")
+                await asyncio.to_thread(finish_turn, sid, "IDLE", None)
+                await stream.emit("status", status="IDLE", message=None)
+            except Exception:  # noqa: BLE001
+                log.exception("session %s: orphan recovery failed", sid)
+                await self.fail_session(sid)
 
     async def release_idle(self) -> None:
         now = time.monotonic()
@@ -537,13 +548,22 @@ class Worker:
         try:
             while not self.stopping:
                 ran = False
-                for item in await asyncio.to_thread(my_sessions, {"IDLE"}, True):
-                    if await asyncio.to_thread(claim_turn, item["task_id"]):
-                        await self.run_one_turn(item["task_id"])
-                        ran = True
-                        break
-                await self.close_requested_idle()
-                await self.release_idle()
+                try:
+                    for item in await asyncio.to_thread(my_sessions, {"IDLE"}, True):
+                        if await asyncio.to_thread(claim_turn, item["task_id"]):
+                            ran = True
+                            try:
+                                await self.run_one_turn(item["task_id"])
+                            except Exception:  # noqa: BLE001 - one bad session must not kill the worker
+                                log.exception("session %s: turn bookkeeping failed", item["task_id"])
+                                await self.fail_session(item["task_id"])
+                            break
+                    await self.close_requested_idle()
+                    await self.release_idle()
+                except Exception:  # noqa: BLE001 - transient AWS errors: back off and retry
+                    log.exception("worker loop error; retrying in %ss", POLL_SECONDS)
+                    await asyncio.sleep(POLL_SECONDS)
+                    continue
                 if ran:
                     continue
                 self.wake.clear()
@@ -557,6 +577,16 @@ class Worker:
                 await live.release()
             if self.mqtt is not None:
                 self.mqtt.stop()
+
+    async def fail_session(self, sid: str) -> None:
+        """Last resort: mark the session FAILED so it does not loop forever."""
+        live = self.live.pop(sid, None)
+        if live is not None:
+            await live.release()
+        try:
+            await asyncio.to_thread(set_fields, sid, status="FAILED", pending_count=0, updated_at=now_iso())
+        except Exception:  # noqa: BLE001
+            log.exception("session %s: could not mark FAILED", sid)
 
     async def run_one_turn(self, sid: str) -> None:
         item = await asyncio.to_thread(get_session, sid)
