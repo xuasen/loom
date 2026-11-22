@@ -3,6 +3,13 @@ Transform: AWS::Serverless-2016-10-31
 Description: Cognito User Pool for Bedrock AgentCore agent authorization
 
 Parameters:
+  pDemoUserCount:
+    Type: Number
+    Default: 9
+    AllowedValues: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    Description: >-
+      How many demo-user-N / demo-admin-N pairs to create (N = 1..count).
+      Lowering it removes the higher-numbered pairs on the next deploy.
   pPoolName:
     Type: String
     Description: Name of the Cognito User Pool
@@ -29,6 +36,17 @@ Parameters:
   pTagOwner:
     Type: String
     Description: Value for the loom:owner tag
+
+Conditions:
+  HasDemo1: !Not [!Equals [!Ref pDemoUserCount, 0]]
+  HasDemo2: !And [!Condition HasDemo1, !Not [!Equals [!Ref pDemoUserCount, 1]]]
+  HasDemo3: !And [!Condition HasDemo2, !Not [!Equals [!Ref pDemoUserCount, 2]]]
+  HasDemo4: !And [!Condition HasDemo3, !Not [!Equals [!Ref pDemoUserCount, 3]]]
+  HasDemo5: !And [!Condition HasDemo4, !Not [!Equals [!Ref pDemoUserCount, 4]]]
+  HasDemo6: !And [!Condition HasDemo5, !Not [!Equals [!Ref pDemoUserCount, 5]]]
+  HasDemo7: !And [!Condition HasDemo6, !Not [!Equals [!Ref pDemoUserCount, 6]]]
+  HasDemo8: !And [!Condition HasDemo7, !Not [!Equals [!Ref pDemoUserCount, 7]]]
+  HasDemo9: !And [!Condition HasDemo8, !Not [!Equals [!Ref pDemoUserCount, 8]]]
 
 Resources:
   CognitoUserPool:
@@ -203,6 +221,7 @@ Resources:
           Value: admin@heeki.cloud
 
   DemoAdmin1User:
+    Condition: HasDemo1
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -212,6 +231,7 @@ Resources:
           Value: demo-admin-1@heeki.cloud
 
   DemoAdmin2User:
+    Condition: HasDemo2
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -221,6 +241,7 @@ Resources:
           Value: demo-admin-2@heeki.cloud
 
   DemoAdmin3User:
+    Condition: HasDemo3
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -230,6 +251,7 @@ Resources:
           Value: demo-admin-3@heeki.cloud
 
   DemoAdmin4User:
+    Condition: HasDemo4
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -239,6 +261,7 @@ Resources:
           Value: demo-admin-4@heeki.cloud
 
   DemoAdmin5User:
+    Condition: HasDemo5
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -248,6 +271,7 @@ Resources:
           Value: demo-admin-5@heeki.cloud
 
   DemoAdmin6User:
+    Condition: HasDemo6
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -257,6 +281,7 @@ Resources:
           Value: demo-admin-6@heeki.cloud
 
   DemoAdmin7User:
+    Condition: HasDemo7
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -266,6 +291,7 @@ Resources:
           Value: demo-admin-7@heeki.cloud
 
   DemoAdmin8User:
+    Condition: HasDemo8
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -275,6 +301,7 @@ Resources:
           Value: demo-admin-8@heeki.cloud
 
   DemoAdmin9User:
+    Condition: HasDemo9
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -302,6 +329,7 @@ Resources:
           Value: integration-admin@heeki.cloud
 
   DemoUser1User:
+    Condition: HasDemo1
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -311,6 +339,7 @@ Resources:
           Value: demo-user-1@heeki.cloud
 
   DemoUser2User:
+    Condition: HasDemo2
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -320,6 +349,7 @@ Resources:
           Value: demo-user-2@heeki.cloud
 
   DemoUser3User:
+    Condition: HasDemo3
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -329,6 +359,7 @@ Resources:
           Value: demo-user-3@heeki.cloud
 
   DemoUser4User:
+    Condition: HasDemo4
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -338,6 +369,7 @@ Resources:
           Value: demo-user-4@heeki.cloud
 
   DemoUser5User:
+    Condition: HasDemo5
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -347,6 +379,7 @@ Resources:
           Value: demo-user-5@heeki.cloud
 
   DemoUser6User:
+    Condition: HasDemo6
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -356,6 +389,7 @@ Resources:
           Value: demo-user-6@heeki.cloud
 
   DemoUser7User:
+    Condition: HasDemo7
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -365,6 +399,7 @@ Resources:
           Value: demo-user-7@heeki.cloud
 
   DemoUser8User:
+    Condition: HasDemo8
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -374,6 +409,7 @@ Resources:
           Value: demo-user-8@heeki.cloud
 
   DemoUser9User:
+    Condition: HasDemo9
     Type: AWS::Cognito::UserPoolUser
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -409,6 +445,7 @@ Resources:
 
   # Demo-admin-1 through demo-admin-9: t-admin + g-admins-demo
   DemoAdmin1ToTypeAdmin:
+    Condition: HasDemo1
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -416,6 +453,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   DemoAdmin1ToGroupAdminsDemo:
+    Condition: HasDemo1
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -423,6 +461,7 @@ Resources:
       GroupName: !Ref GroupAdminsDemoGroup
 
   DemoAdmin2ToTypeAdmin:
+    Condition: HasDemo2
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -430,6 +469,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   DemoAdmin2ToGroupAdminsDemo:
+    Condition: HasDemo2
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -437,6 +477,7 @@ Resources:
       GroupName: !Ref GroupAdminsDemoGroup
 
   DemoAdmin3ToTypeAdmin:
+    Condition: HasDemo3
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -444,6 +485,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   DemoAdmin3ToGroupAdminsDemo:
+    Condition: HasDemo3
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -451,6 +493,7 @@ Resources:
       GroupName: !Ref GroupAdminsDemoGroup
 
   DemoAdmin4ToTypeAdmin:
+    Condition: HasDemo4
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -458,6 +501,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   DemoAdmin4ToGroupAdminsDemo:
+    Condition: HasDemo4
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -465,6 +509,7 @@ Resources:
       GroupName: !Ref GroupAdminsDemoGroup
 
   DemoAdmin5ToTypeAdmin:
+    Condition: HasDemo5
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -472,6 +517,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   DemoAdmin5ToGroupAdminsDemo:
+    Condition: HasDemo5
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -479,6 +525,7 @@ Resources:
       GroupName: !Ref GroupAdminsDemoGroup
 
   DemoAdmin6ToTypeAdmin:
+    Condition: HasDemo6
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -486,6 +533,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   DemoAdmin6ToGroupAdminsDemo:
+    Condition: HasDemo6
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -493,6 +541,7 @@ Resources:
       GroupName: !Ref GroupAdminsDemoGroup
 
   DemoAdmin7ToTypeAdmin:
+    Condition: HasDemo7
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -500,6 +549,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   DemoAdmin7ToGroupAdminsDemo:
+    Condition: HasDemo7
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -507,6 +557,7 @@ Resources:
       GroupName: !Ref GroupAdminsDemoGroup
 
   DemoAdmin8ToTypeAdmin:
+    Condition: HasDemo8
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -514,6 +565,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   DemoAdmin8ToGroupAdminsDemo:
+    Condition: HasDemo8
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -521,6 +573,7 @@ Resources:
       GroupName: !Ref GroupAdminsDemoGroup
 
   DemoAdmin9ToTypeAdmin:
+    Condition: HasDemo9
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -528,6 +581,7 @@ Resources:
       GroupName: !Ref TypeAdminGroup
 
   DemoAdmin9ToGroupAdminsDemo:
+    Condition: HasDemo9
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -580,6 +634,7 @@ Resources:
 
   # Demo-user-1 through demo-user-9: t-user + g-users-demo
   DemoUser1ToTypeUser:
+    Condition: HasDemo1
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -587,6 +642,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   DemoUser1ToGroupUsersDemo:
+    Condition: HasDemo1
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -594,6 +650,7 @@ Resources:
       GroupName: !Ref GroupUsersDemoGroup
 
   DemoUser2ToTypeUser:
+    Condition: HasDemo2
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -601,6 +658,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   DemoUser2ToGroupUsersDemo:
+    Condition: HasDemo2
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -608,6 +666,7 @@ Resources:
       GroupName: !Ref GroupUsersDemoGroup
 
   DemoUser3ToTypeUser:
+    Condition: HasDemo3
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -615,6 +674,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   DemoUser3ToGroupUsersDemo:
+    Condition: HasDemo3
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -622,6 +682,7 @@ Resources:
       GroupName: !Ref GroupUsersDemoGroup
 
   DemoUser4ToTypeUser:
+    Condition: HasDemo4
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -629,6 +690,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   DemoUser4ToGroupUsersDemo:
+    Condition: HasDemo4
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -636,6 +698,7 @@ Resources:
       GroupName: !Ref GroupUsersDemoGroup
 
   DemoUser5ToTypeUser:
+    Condition: HasDemo5
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -643,6 +706,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   DemoUser5ToGroupUsersDemo:
+    Condition: HasDemo5
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -650,6 +714,7 @@ Resources:
       GroupName: !Ref GroupUsersDemoGroup
 
   DemoUser6ToTypeUser:
+    Condition: HasDemo6
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -657,6 +722,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   DemoUser6ToGroupUsersDemo:
+    Condition: HasDemo6
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -664,6 +730,7 @@ Resources:
       GroupName: !Ref GroupUsersDemoGroup
 
   DemoUser7ToTypeUser:
+    Condition: HasDemo7
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -671,6 +738,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   DemoUser7ToGroupUsersDemo:
+    Condition: HasDemo7
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -678,6 +746,7 @@ Resources:
       GroupName: !Ref GroupUsersDemoGroup
 
   DemoUser8ToTypeUser:
+    Condition: HasDemo8
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -685,6 +754,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   DemoUser8ToGroupUsersDemo:
+    Condition: HasDemo8
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -692,6 +762,7 @@ Resources:
       GroupName: !Ref GroupUsersDemoGroup
 
   DemoUser9ToTypeUser:
+    Condition: HasDemo9
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
@@ -699,6 +770,7 @@ Resources:
       GroupName: !Ref TypeUserGroup
 
   DemoUser9ToGroupUsersDemo:
+    Condition: HasDemo9
     Type: AWS::Cognito::UserPoolUserToGroupAttachment
     Properties:
       UserPoolId: !Ref CognitoUserPool
