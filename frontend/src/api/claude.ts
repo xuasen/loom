@@ -68,7 +68,8 @@ export type ClaudeEventType =
   | "turn_end"
   | "mode"
   | "model"
-  | "error";
+  | "error"
+  | "file";
 
 export interface ClaudeEvent {
   seq: number;
@@ -92,6 +93,12 @@ export interface ClaudeEvent {
   attachments?: { name: string; size: number }[];
   /** user_message sent while a turn ran and passed to Claude mid-turn. */
   steer?: boolean;
+  /** file: a generated file the user can download. */
+  file_id?: string;
+  name?: string;
+  size?: number;
+  content_type?: string;
+  path?: string | null;
   /** user_message sent by a schedule (its name). */
   scheduled?: string;
 }
@@ -333,6 +340,40 @@ export function interruptClaudeSession(id: string): Promise<void> {
 
 export function setClaudeSessionFolder(id: string, folder: string): Promise<ClaudeSession> {
   return apiFetch<ClaudeSession>(path(id, "/folder"), { method: "POST", body: JSON.stringify({ folder }) });
+}
+
+/** Fetch a generated file with the bearer token (downloads go through the backend). */
+export async function fetchClaudeOutput(sessionId: string, fileId: string, inline = false): Promise<Blob> {
+  const url = `${getBaseUrl()}${path(sessionId, `/files/${encodeURIComponent(fileId)}${inline ? "?inline=1" : ""}`)}`;
+  const get = (token: string | null) => fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  let r = await get(getAuthToken());
+  if (r.status === 401) {
+    const t = await tryRefreshToken();
+    if (t) r = await get(t);
+  }
+  if (!r.ok) {
+    let detail = `HTTP ${r.status}`;
+    try {
+      const b = (await r.json()) as { detail?: unknown };
+      if (typeof b.detail === "string") detail = b.detail;
+    } catch {
+      /* keep default */
+    }
+    throw new Error(detail);
+  }
+  return r.blob();
+}
+
+export async function downloadClaudeOutput(sessionId: string, fileId: string, name: string): Promise<void> {
+  const blob = await fetchClaudeOutput(sessionId, fileId);
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 30000);
 }
 
 export function deleteClaudeSession(id: string): Promise<void> {

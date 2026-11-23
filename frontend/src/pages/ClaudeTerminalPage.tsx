@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle, ArrowDown, Menu, Check, ChevronRight, Clock, CornerDownRight, FileText, Folder, FolderInput, GripHorizontal, Loader2, Maximize2, Minimize2, Paperclip, Send, Shield, Sparkles, Square, Trash2, X, XCircle,
+  AlertTriangle, ArrowDown, Download, Menu, Check, ChevronRight, Clock, CornerDownRight, FileText, Folder, FolderInput, GripHorizontal, Loader2, Maximize2, Minimize2, Paperclip, Send, Shield, Sparkles, Square, Trash2, X, XCircle,
 } from "lucide-react";
 import { notifyClaudeChanged } from "@/hooks/useClaudeNav";
 import { toast } from "sonner";
@@ -15,6 +15,8 @@ import {
   createClaudeSession,
   decideClaudeApproval,
   deleteClaudeSession,
+  downloadClaudeOutput,
+  fetchClaudeOutput,
   getClaudeConfig,
   getClaudeEvents,
   getClaudeSession,
@@ -214,6 +216,64 @@ function openApprovalIds(events: ClaudeEvent[]): Set<string> {
   return open;
 }
 
+function FileCard({ sessionId, event }: { sessionId: string; event: ClaudeEvent }) {
+  const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState<string | null>(null);
+  const isImage = (event.content_type ?? "").startsWith("image/") && event.content_type !== "image/svg+xml";
+  useEffect(() => {
+    if (!isImage || !event.file_id || (event.size ?? 0) > 15 * 1024 * 1024) return;
+    let url: string | null = null;
+    let cancelled = false;
+    fetchClaudeOutput(sessionId, event.file_id, true)
+      .then((b) => {
+        if (cancelled) return;
+        url = URL.createObjectURL(b);
+        setPreview(url);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [sessionId, event.file_id, isImage, event.size]);
+  const download = async () => {
+    if (!event.file_id) return;
+    setBusy(true);
+    try {
+      await downloadClaudeOutput(sessionId, event.file_id, event.name ?? "file");
+    } catch (e) {
+      toast.error(`Download failed: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="max-w-md overflow-hidden rounded-2xl bg-muted/60">
+      {preview && (
+        <button type="button" onClick={() => void download()} className="block w-full bg-background/40">
+          <img src={preview} alt={event.name} className="max-h-72 w-full object-contain" />
+        </button>
+      )}
+      <div className="flex items-center gap-3 px-3.5 py-3">
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-background">
+          <FileText className="h-4 w-4 text-muted-foreground" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-medium">{event.name}</div>
+          <div className="truncate text-xs text-muted-foreground">
+            {humanSize(event.size ?? 0)}
+            {event.path ? ` · ${shortPath(event.path)}` : ""}
+          </div>
+        </div>
+        <Button size="sm" className="h-9 shrink-0 rounded-full px-3.5" disabled={busy} onClick={() => void download()}>
+          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+          <span className="hidden sm:inline">Download</span>
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function ToolRow({ event }: { event: ClaudeEvent }) {
   return (
     <div className="flex items-start gap-2 font-mono text-xs text-muted-foreground min-w-0">
@@ -231,8 +291,10 @@ function EventRow({
   open,
   onDecide,
   labels,
+  sessionId,
 }: {
   event: ClaudeEvent;
+  sessionId: string;
   open: boolean;
   onDecide: (approvalId: string, decision: "allow" | "deny") => void;
   labels?: Record<string, string>;
@@ -240,6 +302,8 @@ function EventRow({
   switch (event.type) {
     case "tool_use":
       return <ToolRow event={event} />;
+    case "file":
+      return <FileCard sessionId={sessionId} event={event} />;
     case "tool_result":
       return (
         <details className="group pl-3.5 font-mono text-xs">
@@ -895,6 +959,7 @@ export function ClaudeTerminalPage({
                 open={!!b.event.approval_id && openApprovals.has(b.event.approval_id) && !isClosed}
                 onDecide={(id, d) => void decide(id, d)}
                 labels={config.model_labels}
+                sessionId={selectedId!}
               />
             ),
           )}

@@ -1015,3 +1015,55 @@ def delete_session(session_id: str, user: UserInfo = Depends(require_scopes(REQU
         ExpressionAttributeValues={":y": True, ":t": _now_iso(), ":u": user.username},
     )
     logger.info("Claude session %s deleted by %s", session_id, user.username)
+
+
+@router.get("/sessions/{session_id}/files/{file_id}")
+def download_output(
+    session_id: str,
+    file_id: str,
+    inline: bool = Query(False),
+    user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE)),
+) -> StreamingResponse:
+    """Download a file Claude generated in this session (owner only).
+
+    Workers upload deliverables to outputs/<worker>/<session>/<file id>/<name>
+    in the private files bucket; the bytes are streamed through this route,
+    so downloads go through CloudFront/WAF and the Loom login like everything
+    else. ``inline=1`` serves images/PDFs for in-page preview.
+    """
+    from urllib.parse import quote
+
+    _require_enabled()
+    if not re.fullmatch(r"[a-f0-9]{16}", file_id):
+        raise HTTPException(status_code=404, detail="File not found")
+    item = _get_item(session_id)
+    if item.get("submitted_by") != user.username:
+        raise HTTPException(status_code=403, detail="Only the session owner can download its files")
+    prefix = f"outputs/{item['worker_id']}/{session_id}/{file_id}/"
+    objs = _s3_client().list_objects_v2(Bucket=_files_bucket(), Prefix=prefix, MaxKeys=2).get("Contents") or []
+    if len(objs) != 1:
+        raise HTTPException(status_code=404, detail="File not found or expired")
+    key = objs[0]["Key"]
+    name = key.rsplit("/", 1)[-1]
+    obj = _s3_client().get_object(Bucket=_files_bucket(), Key=key)
+    ctype = obj.get("ContentType") or "application/octet-stream"
+    previewable = ctype.startswith("image/") and ctype != "image/svg+xml" or ctype == "application/pdf"
+    disposition = "inline" if inline and previewable else "attachment"
+    if disposition == "attachment":
+        ctype = "application/octet-stream" if ctype.startswith("text/html") or ctype == "image/svg+xml" else ctype
+    body = obj["Body"]
+
+    def chunks():
+        try:
+            for chunk in body.iter_chunks(chunk_size=1024 * 1024):
+                yield chunk
+        finally:
+            body.close()
+
+    logger.info("Claude output %s downloaded by %s", key, user.username)
+    return StreamingResponse(chunks(), media_type=ctype, headers={
+        "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(name)}",
+        "Content-Length": str(obj["ContentLength"]),
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    })

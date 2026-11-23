@@ -594,12 +594,16 @@ Resources:
                 - Effect: Allow
                   Action: s3:PutObject
                   Resource: !Sub "arn:aws:s3:::loom-claude-files-${AWS::AccountId}-${AWS::Region}/uploads/*"
+                # Stream files the workers generated back to their owners.
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Sub "arn:aws:s3:::loom-claude-files-${AWS::AccountId}-${AWS::Region}/outputs/*"
                 - Effect: Allow
                   Action: s3:ListBucket
                   Resource: !Sub "arn:aws:s3:::loom-claude-files-${AWS::AccountId}-${AWS::Region}"
                   Condition:
                     StringLike:
-                      s3:prefix: ["uploads/*"]
+                      s3:prefix: ["uploads/*", "outputs/*"]
           - !Ref AWS::NoValue
       Tags:
         - Key: loom:application

@@ -46,6 +46,12 @@ EVENTS_TABLE = os.environ.get("EVENTS_TABLE", "loom-claude-events")
 WORKERS_TABLE = os.environ.get("WORKERS_TABLE", "loom-claude-workers")
 FILES_BUCKET = os.environ.get("FILES_BUCKET", "")
 UPLOADS_DIR = os.path.realpath(os.path.expanduser(os.environ.get("UPLOADS_DIR", "~/loom-uploads")))
+# Files Claude produces for the user are staged here per session, uploaded to
+# S3 at the end of the turn (via the VPC's S3 gateway endpoint) and removed
+# from this host. The user downloads them through Loom.
+OUTPUTS_DIR = os.path.realpath(os.path.expanduser(os.environ.get("OUTPUTS_DIR", "~/loom-outputs")))
+MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_MB", "200")) * 1024 * 1024
+MAX_OUTPUTS_PER_TURN = 30
 WORKDIR = os.path.realpath(os.path.expanduser(os.environ.get("WORKDIR", "~/work")))
 HOME = os.path.realpath(os.path.expanduser("~"))
 # Where to look for projects the UI can open a session in (colon-separated).
@@ -318,6 +324,60 @@ def download_attachments(sid: str, attachments: list[dict]) -> list[dict]:
         s3.download_file(FILES_BUCKET, key, dest)
         saved.append({"path": dest, "name": name, "size": int(a.get("size") or os.path.getsize(dest))})
     return saved
+
+
+def publish_outputs(sid: str, outputs_dir: str, written: list[str]) -> list[dict]:
+    """Upload this turn's deliverables to S3; return their descriptors.
+
+    - Everything under the session's staging dir is uploaded and then deleted
+      locally (deliverables do not stay on the host).
+    - Files Claude created with Write elsewhere (e.g. inside the project) are
+      uploaded as a copy and left in place.
+    """
+    import mimetypes
+
+    candidates: list[tuple[str, bool]] = []  # (path, remove after upload)
+    for root, _dirs, names in os.walk(outputs_dir):
+        for n in sorted(names):
+            candidates.append((os.path.join(root, n), True))
+    seen = {p for p, _ in candidates}
+    for p in written:
+        real = os.path.realpath(p)
+        if real not in seen and not real.startswith(outputs_dir + os.sep):
+            candidates.append((real, False))
+            seen.add(real)
+
+    out: list[dict] = []
+    for path, remove in candidates[:MAX_OUTPUTS_PER_TURN]:
+        try:
+            if not os.path.isfile(path) or os.path.islink(path) or SENSITIVE_PATH.search(path):
+                continue
+            if not (path == HOME or path.startswith(HOME + os.sep)):
+                continue
+            size = os.path.getsize(path)
+            if size == 0 or size > MAX_OUTPUT_BYTES:
+                log.info("session %s: skipped output %s (%d bytes)", sid, path, size)
+                continue
+            rel = os.path.relpath(path, outputs_dir) if remove else os.path.basename(path)
+            name = re.sub(r"[^\w.()\[\]+@,-]", "_", os.path.basename(rel))[:150] or "file"
+            fid = uuid.uuid4().hex[:16]
+            ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            s3.upload_file(path, FILES_BUCKET, f"outputs/{WORKER_ID}/{sid}/{fid}/{name}",
+                           ExtraArgs={"ContentType": ctype})
+            out.append({"file_id": fid, "name": name, "size": size, "content_type": ctype,
+                        "path": None if remove else path})
+            if remove:
+                os.remove(path)
+        except Exception:  # noqa: BLE001 - one bad file must not lose the rest
+            log.exception("session %s: could not publish %s", sid, path)
+    # tidy empty staging sub-directories
+    for root, dirs, _ in os.walk(outputs_dir, topdown=False):
+        for d in dirs:
+            try:
+                os.rmdir(os.path.join(root, d))
+            except OSError:
+                pass
+    return out
 
 
 def attachment_note(saved: list[dict]) -> str:
@@ -601,6 +661,8 @@ class LiveSession:
         self.cwd = resolve_cwd(item.get("cwd"))
         self.uploads_dir = os.path.join(UPLOADS_DIR, self.sid)
         os.makedirs(self.uploads_dir, exist_ok=True)
+        self.outputs_dir = os.path.join(OUTPUTS_DIR, self.sid)
+        os.makedirs(self.outputs_dir, exist_ok=True)
         self.stream = EventStream(self.sid, int(item.get("last_seq") or 0))
         self.client: ClaudeSDKClient | None = None
         self.last_used = time.monotonic()
@@ -746,9 +808,17 @@ class LiveSession:
                 can_use_tool=self._can_use_tool,
                 hooks={"PreToolUse": [guard]},
                 include_partial_messages=True,
-                system_prompt={"type": "preset", "preset": "claude_code"},
+                system_prompt={"type": "preset", "preset": "claude_code", "append": (
+                    "\n\n# Delivering files to the user\n"
+                    "The user talks to you through a web UI, not a terminal, so they cannot open files on "
+                    f"this machine. When you produce a file for them (report, image, document, archive, "
+                    f"export, generated code bundle), save it in {self.outputs_dir} . Every file there is "
+                    "uploaded at the end of your reply, offered to the user as a download, and removed from "
+                    "this machine. New files you create with the Write tool elsewhere are offered as a "
+                    "download too (and kept in place). Mention the file name in your reply."
+                )},
                 setting_sources=["user", "project", "local"],
-                add_dirs=[self.uploads_dir],
+                add_dirs=[self.uploads_dir, self.outputs_dir],
             )
             client = ClaudeSDKClient(options=options)
             await client.connect()
@@ -811,6 +881,7 @@ class LiveSession:
         last_flush = time.monotonic()
         streamed_text = False
         steered = 0
+        written: list[str] = []
         tools_in_flight: set[str] = set()
         last_text = ""
 
@@ -880,6 +951,10 @@ class LiveSession:
                             elif bkind == "ToolUseBlock":
                                 if getattr(msg, "parent_tool_use_id", None) is None:
                                     tools_in_flight.add(getattr(block, "id", "") or uuid.uuid4().hex)
+                                if block.name in ("Write", "NotebookEdit"):
+                                    fp = (block.input or {}).get("file_path") or (block.input or {}).get("notebook_path")
+                                    if isinstance(fp, str) and fp:
+                                        written.append(os.path.join(self.cwd, os.path.expanduser(fp)))
                                 await self.stream.emit("tool_use", tool=block.name, input=block.input)
                         streamed_text = False
                     elif kind == "UserMessage":
@@ -917,6 +992,17 @@ class LiveSession:
             last_text = f"{type(e).__name__}: {e}"
             await self.stream.emit("error", message=last_text)
             await self.release()
+
+        # Hand this turn's deliverables to the user (S3), even after an error.
+        if FILES_BUCKET:
+            try:
+                files = await asyncio.to_thread(publish_outputs, self.sid, self.outputs_dir, written)
+                for f in files:
+                    await self.stream.emit("file", file_id=f["file_id"], name=f["name"], size=f["size"],
+                                           content_type=f["content_type"], path=f["path"])
+            except Exception as e:  # noqa: BLE001
+                log.exception("session %s: publishing outputs failed", self.sid)
+                await self.stream.emit("error", message=f"Could not publish generated files: {type(e).__name__}: {e}")
 
         self.last_used = time.monotonic()
         # Tell the owner when a long (or scheduled) turn is done; the page
