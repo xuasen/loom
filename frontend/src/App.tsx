@@ -1011,9 +1011,9 @@ function AppContent() {
       </aside>
 
       {/* Main content */}
-      <div className="flex-1 min-w-0 flex flex-col overflow-y-auto">
-        {/* Mobile top bar */}
-        <div className="md:hidden sticky top-0 z-20 flex h-14 shrink-0 items-center gap-3 border-b bg-background/95 px-3 pt-[env(safe-area-inset-top)] backdrop-blur">
+      <div className={`flex-1 min-w-0 flex flex-col ${activePersona === "claude" ? "overflow-hidden" : "overflow-y-auto"}`}>
+        {/* Mobile top bar (the Claude page draws its own) */}
+        <div className={`${activePersona === "claude" ? "hidden" : "md:hidden"} sticky top-0 z-20 flex h-14 shrink-0 items-center gap-3 border-b bg-background/95 px-3 pt-[env(safe-area-inset-top)] backdrop-blur">
           <button
             type="button"
             aria-label="Open menu"
@@ -1055,7 +1055,7 @@ function AppContent() {
         <main
           className={
             activePersona === "claude"
-              ? "flex-1 w-full min-h-0 md:px-6 md:py-4"
+              ? "flex flex-1 w-full min-h-0 flex-col"
               : "max-w-7xl px-4 py-4 md:px-8 md:py-6 flex-1 w-full"
           }
         >
@@ -1191,7 +1191,7 @@ function AppContent() {
             <SkillsPage key={`skill-${pendingSkillId ?? "none"}`} initialSelectedId={pendingSkillId} />
           )}
           {activePersona === "claude" && effectiveHasScope("admin:write") && (
-            <ClaudeTerminalPage project={claudeProject} device={claudeDevice} request={claudeRequest} />
+            <ClaudeTerminalPage project={claudeProject} device={claudeDevice} request={claudeRequest} onOpenNav={() => setNavOpen(true)} />
           )}
           {activePersona === "overview" && (
             <OverviewPage

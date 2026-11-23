@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle, ArrowDown, Check, ChevronRight, Clock, CornerDownRight, FileText, Folder, FolderInput, GripHorizontal, Loader2, Maximize2, Minimize2, Paperclip, Send, Shield, Sparkles, Square, Trash2, X, XCircle,
+  AlertTriangle, ArrowDown, Menu, Check, ChevronRight, Clock, CornerDownRight, FileText, Folder, FolderInput, GripHorizontal, Loader2, Maximize2, Minimize2, Paperclip, Send, Shield, Sparkles, Square, Trash2, X, XCircle,
 } from "lucide-react";
 import { notifyClaudeChanged } from "@/hooks/useClaudeNav";
 import { toast } from "sonner";
@@ -251,7 +251,7 @@ function EventRow({
             <ChevronRight className="h-3 w-3 transition-transform group-open:rotate-90" />
             {event.is_error ? "Error" : "Output"} · {(event.output ?? "").length.toLocaleString()} chars
           </summary>
-          <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/40 p-2.5">
+          <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted/50 p-3">
             {event.output}
           </pre>
         </details>
@@ -332,6 +332,7 @@ function PillSelect<T extends string>({
   onChange,
   label,
   disabled,
+  compact,
 }: {
   icon: React.ReactNode;
   value: T;
@@ -339,17 +340,19 @@ function PillSelect<T extends string>({
   onChange: (v: T) => void;
   label: string;
   disabled?: boolean;
+  /** Icon only on phones. */
+  compact?: boolean;
 }) {
   const current = options.find((o) => o.value === value)?.label ?? value;
   return (
     <label
-      className={`relative inline-flex h-8 max-w-[11rem] shrink-0 items-center gap-1.5 rounded-full border bg-background px-3 text-xs text-muted-foreground transition-colors ${
-        disabled ? "opacity-50" : "hover:bg-accent hover:text-foreground"
-      }`}
+      className={`relative inline-flex h-8 max-w-[11rem] shrink-0 items-center gap-1.5 rounded-full px-2.5 text-xs text-muted-foreground transition-colors ${
+        compact ? "w-8 justify-center px-0 sm:w-auto sm:justify-start sm:px-2.5" : ""
+      } ${disabled ? "opacity-50" : "hover:bg-accent hover:text-foreground"}`}
       title={label}
     >
       {icon}
-      <span className="truncate">{current}</span>
+      <span className={`truncate ${compact ? "hidden sm:inline" : ""}`}>{current}</span>
       <select
         aria-label={label}
         value={value}
@@ -387,12 +390,15 @@ export function ClaudeTerminalPage({
   project = null,
   device = null,
   request = null,
+  onOpenNav,
 }: {
   /** Show only this folder ("项目"); new sessions go into it. */
   project?: string | null;
   /** Show only sessions on this worker ("device"); new sessions run on it. */
   device?: string | null;
   request?: ClaudeNavRequest | null;
+  /** Mobile: open the app navigation drawer (the page owns the only top bar). */
+  onOpenNav?: () => void;
 } = {}) {
   const isTouch = useIsTouch();
   const [config, setConfig] = useState<ClaudeConfig | null>(null);
@@ -742,9 +748,14 @@ export function ClaudeTerminalPage({
   }
 
   const header = (
-    <div className="flex h-14 shrink-0 items-center gap-2 border-b px-2 md:px-4">
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-semibold">
+    <header className="z-10 flex shrink-0 items-center gap-1 bg-background/80 px-2 pt-[env(safe-area-inset-top)] backdrop-blur-xl md:px-5 md:pt-0">
+      {onOpenNav && (
+        <Button size="icon-sm" variant="ghost" className="h-10 w-10 md:hidden" onClick={onOpenNav} aria-label="Open menu">
+          <Menu className="h-5 w-5" />
+        </Button>
+      )}
+      <div className="flex h-14 min-w-0 flex-1 flex-col justify-center px-1">
+        <div className="truncate text-[15px] font-semibold tracking-tight">
           {selectedId ? selected?.title || "Session" : "New session"}
         </div>
         {selectedId && effectiveStatus && (
@@ -768,10 +779,17 @@ export function ClaudeTerminalPage({
           ]}
           onChange={(v) => void moveToFolder(v)}
           label="Move to folder"
+          compact
         />
       )}
       {selectedId && !isClosed && (
-        <Button size="sm" variant="ghost" onClick={() => void endSession()} className="text-muted-foreground">
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => void endSession()}
+          className="h-8 px-2 text-muted-foreground"
+          title="End session"
+        >
           <XCircle className="h-4 w-4" />
           <span className="hidden sm:inline">End</span>
         </Button>
@@ -781,14 +799,14 @@ export function ClaudeTerminalPage({
           size="icon-sm"
           variant="ghost"
           onClick={() => void deleteSession()}
-          className="text-muted-foreground hover:text-destructive"
+          className="h-8 w-8 text-muted-foreground hover:text-destructive"
           aria-label="Delete session"
           title="Delete session"
         >
           <Trash2 className="h-4 w-4" />
         </Button>
       )}
-    </div>
+    </header>
   );
 
   const transcript = (
@@ -801,9 +819,9 @@ export function ClaudeTerminalPage({
           stickRef.current = atBottom;
           setShowJump(!atBottom);
         }}
-        className="h-full overflow-y-auto overscroll-contain px-3 py-4 md:px-6"
+        className="h-full overflow-y-auto overscroll-contain px-4 pt-4 pb-6 md:px-8 md:pt-6"
       >
-        <div className="mx-auto max-w-3xl space-y-4">
+        <div className="mx-auto max-w-3xl space-y-5">
           {!selectedId && (
             <div className="mx-auto max-w-md py-8 text-center">
               <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-accent">
@@ -900,7 +918,7 @@ export function ClaudeTerminalPage({
             const el = scrollRef.current;
             if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
           }}
-          className="absolute bottom-3 left-1/2 flex h-9 -translate-x-1/2 items-center gap-1 rounded-full border bg-background px-3 text-xs shadow-md"
+          className="absolute bottom-3 left-1/2 flex h-9 -translate-x-1/2 items-center gap-1 rounded-full bg-background/90 px-3.5 text-xs shadow-lg backdrop-blur"
         >
           <ArrowDown className="h-3.5 w-3.5" /> Latest
         </button>
@@ -909,7 +927,7 @@ export function ClaudeTerminalPage({
   );
 
   const composer = isClosed ? (
-    <div className="shrink-0 border-t px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] text-center text-sm text-muted-foreground">
+    <div className="shrink-0 px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] text-center text-sm text-muted-foreground">
       This session has ended.{" "}
       <button type="button" className="font-medium text-foreground underline" onClick={() => openSession(null)}>
         Start a new one
@@ -917,7 +935,7 @@ export function ClaudeTerminalPage({
     </div>
   ) : (
     <div
-      className={`shrink-0 border-t bg-background px-2 pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] md:px-4 md:pb-3 ${
+      className={`shrink-0 bg-background px-3 pt-1 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:px-8 md:pb-5 ${
         dragOver ? "bg-accent/40" : ""
       }`}
       onDragOver={(e) => {
@@ -937,8 +955,8 @@ export function ClaudeTerminalPage({
             {files.map((f) => (
               <span
                 key={f.localId}
-                className={`inline-flex h-8 max-w-[14rem] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs ${
-                  f.error ? "border-destructive/50 text-destructive" : ""
+                className={`inline-flex h-8 max-w-[14rem] shrink-0 items-center gap-1.5 rounded-lg bg-muted px-2 text-xs ${
+                  f.error ? "bg-destructive/10 text-destructive" : ""
                 }`}
                 title={f.error ?? f.file.name}
               >
@@ -964,14 +982,14 @@ export function ClaudeTerminalPage({
           </div>
         )}
 
-        <div className="relative rounded-2xl border bg-card shadow-sm focus-within:ring-2 focus-within:ring-ring/40">
+        <div className="relative rounded-[22px] bg-muted/70 shadow-[0_1px_2px_rgba(0,0,0,0.04),0_10px_30px_-16px_rgba(0,0,0,0.25)] transition-shadow focus-within:bg-muted focus-within:shadow-[0_1px_2px_rgba(0,0,0,0.06),0_12px_36px_-14px_rgba(0,0,0,0.3)]">
           {/* Drag to resize the input (double-click resets it). */}
           <div
             role="separator"
             aria-orientation="horizontal"
             aria-label="Resize input"
             title="Drag to resize · double-click to reset"
-            className="absolute -top-2.5 left-1/2 flex h-5 w-16 -translate-x-1/2 cursor-ns-resize touch-none items-center justify-center rounded-full border bg-background text-muted-foreground hover:text-foreground"
+            className="absolute -top-2 left-1/2 flex h-4 w-12 -translate-x-1/2 cursor-ns-resize touch-none items-center justify-center rounded-full text-muted-foreground/50 hover:bg-muted hover:text-foreground"
             onPointerDown={(e) => {
               e.currentTarget.setPointerCapture(e.pointerId);
               dragRef.current = { startY: e.clientY, startH: inputRef.current?.offsetHeight ?? 44 };
@@ -1100,7 +1118,7 @@ export function ClaudeTerminalPage({
           </div>
         </div>
         {!isTouch && (
-          <div className="mt-1.5 hidden px-2 text-[10px] text-muted-foreground/70 md:block">
+          <div className="mt-2 hidden text-center text-[10px] text-muted-foreground/60 md:block">
             Enter to send · Shift+Enter new line · Shift+Tab switch mode · drop or paste files to attach
           </div>
         )}
@@ -1109,7 +1127,7 @@ export function ClaudeTerminalPage({
   );
 
   return (
-    <div className="flex h-[calc(100dvh-3.5rem)] min-h-0 overflow-hidden bg-background md:h-[calc(100dvh-2rem)] md:rounded-xl md:border">
+    <div className="flex min-h-0 flex-1 overflow-hidden bg-background">
       <section className="flex min-h-0 min-w-0 flex-1 flex-col">
         {header}
         {transcript}
