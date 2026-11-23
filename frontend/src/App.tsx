@@ -123,25 +123,6 @@ function SidebarClock() {
   );
 }
 
-function SidebarSection({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  const items = Children.toArray(children).filter(Boolean);
-  if (items.length === 0) return null;
-  return (
-    <div className="space-y-1">
-      <div className="px-3 pt-1 text-[10px] font-semibold text-muted-foreground/70 uppercase tracking-wide">
-        {label}
-      </div>
-      {items}
-    </div>
-  );
-}
-
 function useCollapsed(key: string, initial = false): [boolean, () => void] {
   const storageKey = `loom:nav:collapsed:${key}`;
   const [collapsed, setCollapsed] = useState<boolean>(() => {
