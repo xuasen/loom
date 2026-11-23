@@ -4,6 +4,7 @@ import {
   FileText, Folder, FolderInput, FolderPlus, GripHorizontal, Loader2, Maximize2, Minimize2, Paperclip, Plus, RefreshCw, Send, Shield, Sparkles, Square, SquareTerminal, Trash2, X, XCircle,
 } from "lucide-react";
 import { ClaudeSchedulesPanel } from "@/components/ClaudeSchedulesPanel";
+import { notifyClaudeChanged } from "@/hooks/useClaudeNav";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { MarkdownBlock } from "@/components/MarkdownRenderer";
@@ -388,7 +389,26 @@ interface PendingFile {
   error?: string;
 }
 
-export function ClaudeTerminalPage() {
+/** What the sidebar asked the page to show. `nonce` makes a repeated click count. */
+export interface ClaudeNavRequest {
+  nonce: number;
+  /** Open this session. */
+  sessionId?: string;
+  /** Start a new session (in `project`, on `device`). */
+  newSession?: boolean;
+}
+
+export function ClaudeTerminalPage({
+  project = null,
+  device = null,
+  request = null,
+}: {
+  /** Show only this folder ("项目"); new sessions go into it. */
+  project?: string | null;
+  /** Show only sessions on this worker ("device"); new sessions run on it. */
+  device?: string | null;
+  request?: ClaudeNavRequest | null;
+} = {}) {
   const isTouch = useIsTouch();
   const [config, setConfig] = useState<ClaudeConfig | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
@@ -435,7 +455,11 @@ export function ClaudeTerminalPage() {
   const effectiveStatus: ClaudeSessionStatus | null = status ?? selected?.status ?? null;
   const isClosed = effectiveStatus !== null && CLOSED_STATUSES.has(effectiveStatus);
   const isBusy = effectiveStatus === "RUNNING" || effectiveStatus === "WAITING_APPROVAL";
-  const worker = config?.workers[0];
+  const worker = config?.workers.find((w) => w.worker_id === device) ?? config?.workers[0];
+  const scoped = useMemo(
+    () => sessions.filter((x) => (project === null || (x.folder || "") === project) && (device === null || x.worker_id === device)),
+    [sessions, project, device],
+  );
   const models = config?.models ?? [];
   const uploading = files.some((f) => !f.fileId && !f.error);
 
@@ -463,6 +487,30 @@ export function ClaudeTerminalPage() {
         );
       });
   }, [refreshSessions]);
+
+  // Sidebar navigation: open a session, or start a new one in this scope.
+  useEffect(() => {
+    if (!request) return;
+    if (request.sessionId) {
+      setSelectedId(request.sessionId);
+      setShowConversation(true);
+      stickRef.current = true;
+    } else if (request.newSession) {
+      setSelectedId(null);
+      setShowConversation(true);
+      setNewFolder(project ?? "");
+      setMode("default");
+      setCwd("");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [request?.nonce]);
+
+  // Switching project/device shows that scope's list (mobile) and clears a stale selection.
+  useEffect(() => {
+    if (request?.sessionId || request?.newSession) return;
+    setShowConversation(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project, device]);
 
   // Deep link (?session=<id>), e.g. from a notification.
   useEffect(() => {
@@ -606,9 +654,11 @@ export function ClaudeTerminalPage() {
       if (!selectedId) {
         const s = await createClaudeSession({
           message: text, mode, model: model || undefined, cwd: cwd || undefined, attachments,
-          folder: newFolder || undefined,
+          folder: newFolder || project || undefined,
+          worker_id: worker?.worker_id,
         });
         setSessions((prev) => [s, ...prev]);
+        notifyClaudeChanged();
         setSelectedId(s.session_id);
       } else {
         await sendClaudeMessage(selectedId, text, attachments);
@@ -670,12 +720,12 @@ export function ClaudeTerminalPage() {
   // Ungrouped first, then folders alphabetically (sub-folders follow their parent).
   const groups = useMemo(() => {
     const by = new Map<string, ClaudeSession[]>();
-    for (const x of sessions) {
+    for (const x of scoped) {
       const f = x.folder || "";
       by.set(f, [...(by.get(f) ?? []), x]);
     }
     return [...by.entries()].sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
-  }, [sessions]);
+  }, [scoped]);
 
   const toggleFolder = (f: string) =>
     setCollapsed((prev) => {
@@ -698,6 +748,7 @@ export function ClaudeTerminalPage() {
       const s = await setClaudeSessionFolder(selectedId, folder);
       setSelected(s);
       setSessions((prev) => prev.map((x) => (x.session_id === s.session_id ? { ...x, folder: s.folder } : x)));
+      notifyClaudeChanged();
     } catch (e) {
       toast.error(`Could not move: ${(e as Error).message}`);
     }
@@ -720,6 +771,7 @@ export function ClaudeTerminalPage() {
       setSelectedId(null);
       setShowConversation(false);
       toast.success("Session deleted");
+      notifyClaudeChanged();
     } catch (e) {
       toast.error(`Could not delete: ${(e as Error).message}`);
     }
@@ -776,8 +828,8 @@ export function ClaudeTerminalPage() {
     >
       <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b px-4">
         <div className="flex items-center gap-2 min-w-0">
-          <SquareTerminal className="h-5 w-5 shrink-0" />
-          <span className="font-semibold truncate">Claude Terminal</span>
+          {project !== null ? <Folder className="h-5 w-5 shrink-0" /> : <SquareTerminal className="h-5 w-5 shrink-0" />}
+          <span className="font-semibold truncate">{project ?? device ?? "Claude device"}</span>
         </div>
         <div className="flex items-center gap-1">
           {config.vapid_public_key && pushSupported() && (
@@ -813,7 +865,7 @@ export function ClaudeTerminalPage() {
         </div>
       )}
       <div className="flex-1 overflow-y-auto overscroll-contain p-2">
-        {sessions.length === 0 && (
+        {scoped.length === 0 && (
           <div className="px-3 py-10 text-center text-sm text-muted-foreground">
             No sessions yet.
             <div className="mt-3">

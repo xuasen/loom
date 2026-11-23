@@ -12,7 +12,11 @@
       "home": "Home",
       "build": "Build",
       "operate": "Operate",
-      "system": "System"
+      "system": "System",
+      "projects": "Projects",
+      "components": "Components",
+      "conversations": "Conversations",
+      "ops": "Operations"
     },
     "catalog": "Catalog",
     "agents": "Agents",
@@ -24,7 +28,15 @@
     "skills": "Skills",
     "claudeTerminal": "Claude Terminal",
     "analytics": "Analytics",
-    "settings": "Settings"
+    "settings": "Settings",
+    "overview": "Overview",
+    "systemSettings": "System settings",
+    "newProject": "New project",
+    "newProjectPrompt": "Project name (use / for sub-projects)",
+    "noProjects": "No projects yet",
+    "newChat": "New conversation",
+    "noChats": "No conversations",
+    "showAll": "Show all {{count}}"
   },
   "settings": {
     "title": "Settings",

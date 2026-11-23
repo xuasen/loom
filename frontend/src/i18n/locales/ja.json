@@ -12,7 +12,11 @@
       "home": "ホーム",
       "build": "ビルド",
       "operate": "運用",
-      "system": "システム"
+      "system": "システム",
+      "projects": "プロジェクト",
+      "components": "コンポーネント",
+      "conversations": "会話",
+      "ops": "運用"
     },
     "catalog": "カタログ",
     "agents": "エージェント",
@@ -24,7 +28,15 @@
     "skills": "スキル",
     "claudeTerminal": "Claude ターミナル",
     "analytics": "アナリティクス",
-    "settings": "設定"
+    "settings": "設定",
+    "overview": "概要",
+    "systemSettings": "システム設定",
+    "newProject": "新しいプロジェクト",
+    "newProjectPrompt": "プロジェクト名（/ でサブプロジェクト）",
+    "noProjects": "プロジェクトはまだありません",
+    "newChat": "新しい会話",
+    "noChats": "会話はありません",
+    "showAll": "すべて表示（{{count}}）"
   },
   "settings": {
     "title": "設定",

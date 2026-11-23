@@ -29,7 +29,9 @@ import { MemoryManagementPage } from "@/pages/MemoryManagementPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { IntegrationsPage } from "@/pages/IntegrationsPage";
 import { SkillsPage } from "@/pages/SkillsPage";
-import { ClaudeTerminalPage } from "@/pages/ClaudeTerminalPage";
+import { ClaudeTerminalPage, type ClaudeNavRequest } from "@/pages/ClaudeTerminalPage";
+import { OverviewPage } from "@/pages/OverviewPage";
+import { useClaudeNav } from "@/hooks/useClaudeNav";
 import type { SessionResponse, InvocationResponse } from "@/api/types";
 import { getRegistryConfig } from "@/api/settings";
 import { listRegistryRecords } from "@/api/registry";
@@ -38,7 +40,7 @@ import { listMcpServers } from "@/api/mcp";
 import { listA2aAgents } from "@/api/a2a";
 import { AuthProvider, useAuth, GROUP_SCOPES, type Scope } from "@/contexts/AuthContext";
 import { LoginPage } from "@/pages/LoginPage";
-import { BookOpen, Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, SquareTerminal, Menu } from "lucide-react";
+import { BookOpen, Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, Menu, LayoutDashboard, ChevronDown, ChevronRight, FolderPlus, Plus, MessageSquare, Monitor, Wrench } from "lucide-react";
 import { AdminDashboardPage } from "./pages/AdminDashboardPage";
 import { ChatPage } from "./pages/ChatPage";
 import { OAuthLinkCallbackPage } from "./pages/OAuthLinkCallbackPage";
@@ -70,7 +72,7 @@ import { recordPageView, sendBeaconPageView, trackAction } from "./api/audit";
 //     registry:write (unchanged from the standalone Registry page's gate)
 //   - Settings > Models > Guardrails card: visible to anyone on Settings;
 //     editable iff admin:write (PUT /api/settings/guardrail-default's scope)
-type Persona = "catalog" | "security" | "builder" | "memory" | "integrations" | "skills" | "settings" | "admin" | "claude";
+type Persona = "overview" | "catalog" | "security" | "builder" | "memory" | "integrations" | "skills" | "settings" | "admin" | "claude";
 
 const USER_GROUPS: Record<string, string[]> = {
   "admin": ["t-admin", "g-admins-super"],
@@ -140,6 +142,102 @@ function SidebarSection({
   );
 }
 
+function useCollapsed(key: string, initial = false): [boolean, () => void] {
+  const storageKey = `loom:nav:collapsed:${key}`;
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    const v = localStorage.getItem(storageKey);
+    return v === null ? initial : v === "1";
+  });
+  const toggle = () =>
+    setCollapsed((c) => {
+      localStorage.setItem(storageKey, c ? "0" : "1");
+      return !c;
+    });
+  return [collapsed, toggle];
+}
+
+/** A sidebar section whose items can be collapsed (state kept per browser). */
+function SidebarGroup({
+  id,
+  label,
+  icon: Icon,
+  action,
+  children,
+}: {
+  id: string;
+  label: string;
+  icon?: React.ComponentType<{ className?: string }>;
+  action?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  const [collapsed, toggle] = useCollapsed(id);
+  const items = Children.toArray(children).filter(Boolean);
+  return (
+    <div className="space-y-0.5">
+      <div className="group flex items-center">
+        <button
+          type="button"
+          onClick={toggle}
+          aria-expanded={!collapsed}
+          className="flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded-md px-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground/80 hover:text-foreground"
+        >
+          {collapsed ? <ChevronRight className="h-3 w-3 shrink-0" /> : <ChevronDown className="h-3 w-3 shrink-0" />}
+          {Icon && <Icon className="h-3.5 w-3.5 shrink-0" />}
+          <span className="truncate">{label}</span>
+        </button>
+        {action}
+      </div>
+      {!collapsed && items}
+    </div>
+  );
+}
+
+/** Compact row for a conversation or project in the sidebar. */
+function SidebarRow({
+  label,
+  active,
+  onClick,
+  dot,
+  indent = 0,
+  leading,
+  trailing,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  dot?: string;
+  indent?: number;
+  leading?: React.ReactNode;
+  trailing?: React.ReactNode;
+}) {
+  return (
+    <div className="group relative flex items-center" style={{ paddingLeft: indent }}>
+      <button
+        type="button"
+        onClick={onClick}
+        className={`flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-3 text-left text-[13px] transition-colors ${
+          active ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+        }`}
+      >
+        {leading}
+        {dot && <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot}`} />}
+        <span className="truncate">{label}</span>
+      </button>
+      {trailing}
+    </div>
+  );
+}
+
+const SESSION_DOT: Record<string, string> = {
+  IDLE: "bg-success/70",
+  RUNNING: "bg-primary animate-pulse",
+  WAITING_APPROVAL: "bg-warning animate-pulse",
+  CLOSED: "bg-muted-foreground/30",
+  FAILED: "bg-destructive",
+};
+
+const MAX_CHATS_PER_DEVICE = 15;
+
 function SidebarItem({
   icon: Icon,
   label,
@@ -190,6 +288,7 @@ function AppContent() {
   const getDefaultPersona = useCallback((): Persona => {
     // Deep link from a Claude Terminal notification: /claude?session=<id>
     if (new URLSearchParams(window.location.search).has("session") && hasScope("admin:write")) return "claude";
+    if (hasScope("admin:write") || hasScope("admin:read")) return "overview";
     if (hasScope("catalog:read")) return "catalog";
     if (hasScope("security:read") || hasScope("security:write")) return "security";
     if (hasScope("memory:read") || hasScope("memory:write")) return "memory";
@@ -207,6 +306,11 @@ function AppContent() {
   const [pendingMcpId, setPendingMcpId] = useState<number | null>(null);
   const [pendingA2aId, setPendingA2aId] = useState<number | null>(null);
   const [pendingSkillId, setPendingSkillId] = useState<string | null>(null);
+  // Claude device conversations: which project/device the page shows, and the last sidebar click.
+  const [claudeProject, setClaudeProject] = useState<string | null>(null);
+  const [claudeDevice, setClaudeDevice] = useState<string | null>(null);
+  const [claudeRequest, setClaudeRequest] = useState<ClaudeNavRequest | null>(null);
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   const [integrationsTab, setIntegrationsTab] = useState<"mcp" | "a2a">("mcp");
 
   // Reset all navigation state when user logs in (skip if returning from link callback)
@@ -353,6 +457,8 @@ function AppContent() {
         .catch(() => {});
     }
   }, [isAuthenticated, effectiveHasScope, registryEnabled]);
+
+  const claudeNav = useClaudeNav(isAuthenticated && effectiveHasScope("admin:write"));
 
   type ViewMode = "cards" | "table";
   const [catalogViewMode, setCatalogViewMode] = useState<ViewMode>("cards");
@@ -507,6 +613,58 @@ function AppContent() {
     breadcrumb.push({ label: selectedInvocationId });
   }
 
+  // ---- sidebar navigation helpers ----
+  const go = (persona: Persona) => {
+    setActivePersona(persona);
+    setNavOpen(false);
+  };
+  const projectNames = Array.from(new Set(claudeNav.sessions.map((x) => x.folder || "").filter(Boolean))).sort((a, b) =>
+    a.localeCompare(b),
+  );
+  const devices = claudeNav.workers.length
+    ? claudeNav.workers
+    : Array.from(new Set(claudeNav.sessions.map((x) => x.worker_id))).map((id) => ({ worker_id: id, online: false }));
+  const nonce = () => Date.now();
+  const openProject = (name: string) => {
+    setClaudeProject(name);
+    setClaudeDevice(null);
+    setClaudeRequest(null);
+    go("claude");
+  };
+  const toggleProject = (name: string) =>
+    setExpandedProjects((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  const newProject = () => {
+    const name = window.prompt(t("nav.newProjectPrompt"))?.trim();
+    if (!name) return;
+    setClaudeProject(name);
+    setClaudeDevice(null);
+    setClaudeRequest({ nonce: nonce(), newSession: true });
+    go("claude");
+  };
+  const openDevice = (id: string) => {
+    setClaudeDevice(id);
+    setClaudeProject(null);
+    setClaudeRequest(null);
+    go("claude");
+  };
+  const newChat = (id: string) => {
+    setClaudeDevice(id);
+    setClaudeProject(null);
+    setClaudeRequest({ nonce: nonce(), newSession: true });
+    go("claude");
+  };
+  const openClaudeSession = (id: string, project: string | null, device: string | null) => {
+    setClaudeProject(project);
+    setClaudeDevice(device);
+    setClaudeRequest({ nonce: nonce(), sessionId: id });
+    go("claude");
+  };
+
   // End-user chat layout — rendered when user (or admin in view-as mode) is a t-user
   if (isEndUser) {
     return (
@@ -540,104 +698,191 @@ function AppContent() {
       )}
       {/* Sidebar: a slide-in drawer below md, a fixed column above */}
       <aside
-        className={`fixed inset-y-0 left-0 z-40 w-64 border-r bg-card flex flex-col shrink-0 h-dvh overflow-y-auto
+        className={`fixed inset-y-0 left-0 z-40 w-72 border-r bg-card flex flex-col shrink-0 h-dvh overflow-hidden
           transition-transform duration-200 ease-out pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]
           ${navOpen ? "translate-x-0 shadow-xl" : "-translate-x-full"}
-          md:static md:z-auto md:w-56 md:translate-x-0 md:shadow-none md:pt-0 md:pb-0`}
+          md:static md:z-auto md:w-64 md:translate-x-0 md:shadow-none md:pt-0 md:pb-0`}
       >
-        <div className="p-4 border-b">
+        <div className="px-4 py-3 border-b shrink-0">
           <img
             src={isLightTheme(theme) ? "/assets/loom_light_alt.png" : "/assets/loom_dark_alt.png"}
             alt="Loom"
-            className="h-15"
+            className="h-12"
           />
         </div>
-        <nav className="flex-1 p-2 space-y-3" onClick={() => setNavOpen(false)}>
-          <SidebarSection label={t("nav.sections.home")}>
+        {/* Scrolling part: overview, projects, components, conversations */}
+        <nav className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-2 space-y-3">
+          {(effectiveHasScope("admin:read") || effectiveHasScope("admin:write")) && (
+            <SidebarItem
+              icon={LayoutDashboard}
+              label={t("nav.overview")}
+              active={activePersona === "overview"}
+              onClick={() => go("overview")}
+            />
+          )}
+
+          {claudeNav.available && (
+            <SidebarGroup
+              id="projects"
+              label={t("nav.sections.projects")}
+              action={
+                <button
+                  type="button"
+                  onClick={newProject}
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                  aria-label={t("nav.newProject")}
+                  title={t("nav.newProject")}
+                >
+                  <FolderPlus className="h-3.5 w-3.5" />
+                </button>
+              }
+            >
+              {projectNames.length === 0 && (
+                <div className="px-3 py-1 text-xs text-muted-foreground/70">{t("nav.noProjects")}</div>
+              )}
+              {projectNames.map((name) => {
+                const open = expandedProjects.has(name);
+                const inProject = claudeNav.sessions.filter((x) => x.folder === name);
+                return (
+                  <div key={name}>
+                    <SidebarRow
+                      label={name}
+                      active={activePersona === "claude" && claudeProject === name && !claudeRequest?.sessionId}
+                      onClick={() => openProject(name)}
+                      leading={
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          aria-label={open ? "Collapse" : "Expand"}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleProject(name);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.stopPropagation();
+                              toggleProject(name);
+                            }
+                          }}
+                          className="-ml-1 flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-accent"
+                        >
+                          {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                        </span>
+                      }
+                      trailing={<span className="absolute right-2 text-[10px] text-muted-foreground/70 tabular-nums group-hover:hidden">{inProject.length}</span>}
+                    />
+                    {open &&
+                      inProject.slice(0, MAX_CHATS_PER_DEVICE).map((x) => (
+                        <SidebarRow
+                          key={x.session_id}
+                          indent={16}
+                          label={x.title || "Untitled"}
+                          dot={SESSION_DOT[x.status]}
+                          active={activePersona === "claude" && claudeRequest?.sessionId === x.session_id}
+                          onClick={() => openClaudeSession(x.session_id, name, null)}
+                        />
+                      ))}
+                  </div>
+                );
+              })}
+            </SidebarGroup>
+          )}
+
+          <SidebarGroup id="components" label={t("nav.sections.components")}>
             {effectiveHasScope("catalog:read") && (
-              <SidebarItem
-                icon={BookOpen}
-                label={t("nav.catalog")}
-                active={activePersona === "catalog"}
-                onClick={() => setActivePersona("catalog")}
-              />
+              <SidebarItem icon={BookOpen} label={t("nav.catalog")} active={activePersona === "catalog"} onClick={() => go("catalog")} />
             )}
-          </SidebarSection>
-          <SidebarSection label={t("nav.sections.build")}>
             {(effectiveHasScope("agent:read") || effectiveHasScope("agent:write")) && (
-              <SidebarItem
-                icon={Bot}
-                label={t("nav.agents")}
-                active={activePersona === "builder"}
-                onClick={() => setActivePersona("builder")}
-                count={agents.length}
-              />
+              <SidebarItem icon={Bot} label={t("nav.agents")} active={activePersona === "builder"} onClick={() => go("builder")} count={agents.length} />
             )}
             {(effectiveHasScope("memory:read") || effectiveHasScope("memory:write")) && (
-              <SidebarItem
-                icon={Brain}
-                label={t("nav.memory")}
-                active={activePersona === "memory"}
-                onClick={() => setActivePersona("memory")}
-                count={memoryCount}
-              />
+              <SidebarItem icon={Brain} label={t("nav.memory")} active={activePersona === "memory"} onClick={() => go("memory")} count={memoryCount} />
             )}
             {(effectiveHasScope("mcp:read") || effectiveHasScope("mcp:write") || effectiveHasScope("a2a:read") || effectiveHasScope("a2a:write")) && (
-              <SidebarItem
-                icon={Network}
-                label={t("nav.integrations")}
-                active={activePersona === "integrations"}
-                onClick={() => setActivePersona("integrations")}
-                count={mcpCount + a2aCount}
-              />
+              <SidebarItem icon={Network} label={t("nav.integrations")} active={activePersona === "integrations"} onClick={() => go("integrations")} count={mcpCount + a2aCount} />
             )}
             {effectiveHasScope("registry:read") && (
-              <SidebarItem
-                icon={Puzzle}
-                label={t("nav.skills")}
-                active={activePersona === "skills"}
-                onClick={() => setActivePersona("skills")}
-                count={skillsCount}
-              />
+              <SidebarItem icon={Puzzle} label={t("nav.skills")} active={activePersona === "skills"} onClick={() => go("skills")} count={skillsCount} />
             )}
-            {effectiveHasScope("admin:write") && (
-              <SidebarItem
-                icon={SquareTerminal}
-                label={t("nav.claudeTerminal")}
-                active={activePersona === "claude"}
-                onClick={() => setActivePersona("claude")}
-              />
-            )}
-          </SidebarSection>
-          <SidebarSection label={t("nav.sections.operate")}>
-            {(effectiveHasScope("security:read") || effectiveHasScope("security:write")) && (
-              <SidebarItem
-                icon={Shield}
-                label={t("nav.security")}
-                active={activePersona === "security"}
-                onClick={() => setActivePersona("security")}
-              />
-            )}
-            {(effectiveHasScope("admin:read") || effectiveHasScope("costs:read") || effectiveHasScope("costs:write")) && (
-              <SidebarItem
-                icon={BarChart3}
-                label={t("nav.analytics")}
-                active={activePersona === "admin"}
-                onClick={() => setActivePersona("admin")}
-              />
-            )}
-          </SidebarSection>
-          <SidebarSection label={t("nav.sections.system")}>
-            {(effectiveHasScope("tagging:read") || effectiveHasScope("tagging:write")) && (
-              <SidebarItem
-                icon={Settings}
-                label={t("nav.settings")}
-                active={activePersona === "settings"}
-                onClick={() => setActivePersona("settings")}
-              />
-            )}
-          </SidebarSection>
+          </SidebarGroup>
+
+          {claudeNav.available && (
+            <SidebarGroup id="conversations" label={t("nav.sections.conversations")}>
+              {devices.map((w) => {
+                const chats = claudeNav.sessions.filter((x) => x.worker_id === w.worker_id && !x.folder);
+                return (
+                  <div key={w.worker_id} className="space-y-0.5">
+                    <SidebarRow
+                      label={`Claude device · ${w.worker_id}`}
+                      dot={w.online ? "bg-success" : "bg-muted-foreground/40"}
+                      leading={<Monitor className="h-3.5 w-3.5 shrink-0" />}
+                      active={activePersona === "claude" && claudeDevice === w.worker_id && claudeProject === null && !claudeRequest?.sessionId}
+                      onClick={() => openDevice(w.worker_id)}
+                      trailing={
+                        <button
+                          type="button"
+                          onClick={() => newChat(w.worker_id)}
+                          className="absolute right-1 flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                          aria-label={t("nav.newChat")}
+                          title={t("nav.newChat")}
+                        >
+                          <Plus className="h-3.5 w-3.5" />
+                        </button>
+                      }
+                    />
+                    {chats.slice(0, MAX_CHATS_PER_DEVICE).map((x) => (
+                      <SidebarRow
+                        key={x.session_id}
+                        indent={12}
+                        label={x.title || "Untitled"}
+                        dot={SESSION_DOT[x.status]}
+                        active={activePersona === "claude" && claudeRequest?.sessionId === x.session_id}
+                        onClick={() => openClaudeSession(x.session_id, null, w.worker_id)}
+                      />
+                    ))}
+                    {chats.length > MAX_CHATS_PER_DEVICE && (
+                      <button
+                        type="button"
+                        onClick={() => openDevice(w.worker_id)}
+                        className="ml-3 px-3 py-1 text-xs text-muted-foreground hover:text-foreground"
+                      >
+                        {t("nav.showAll", { count: chats.length })}
+                      </button>
+                    )}
+                    {chats.length === 0 && (
+                      <div className="pl-6 pr-3 py-1 text-xs text-muted-foreground/70">
+                        <MessageSquare className="mr-1 inline h-3 w-3" />
+                        {t("nav.noChats")}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </SidebarGroup>
+          )}
         </nav>
+
+        {/* Pinned to the bottom: operations and system settings */}
+        <div className="shrink-0 border-t p-2 space-y-0.5">
+          {(effectiveHasScope("security:read") || effectiveHasScope("security:write") || effectiveHasScope("admin:read") || effectiveHasScope("costs:read") || effectiveHasScope("costs:write")) && (
+            <>
+              <div className="flex items-center gap-1.5 px-2 pt-0.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground/80">
+                <Wrench className="h-3 w-3" /> {t("nav.sections.ops")}
+              </div>
+              <div className="grid grid-cols-2 gap-1">
+                {(effectiveHasScope("security:read") || effectiveHasScope("security:write")) && (
+                  <SidebarItem icon={Shield} label={t("nav.security")} active={activePersona === "security"} onClick={() => go("security")} />
+                )}
+                {(effectiveHasScope("admin:read") || effectiveHasScope("costs:read") || effectiveHasScope("costs:write")) && (
+                  <SidebarItem icon={BarChart3} label={t("nav.analytics")} active={activePersona === "admin"} onClick={() => go("admin")} />
+                )}
+              </div>
+            </>
+          )}
+          {(effectiveHasScope("tagging:read") || effectiveHasScope("tagging:write")) && (
+            <SidebarItem icon={Settings} label={t("nav.systemSettings")} active={activePersona === "settings"} onClick={() => go("settings")} />
+          )}
+        </div>
         <div className="p-2 border-t space-y-1">
           {user && (
             <TooltipProvider>
@@ -890,7 +1135,29 @@ function AppContent() {
           {activePersona === "skills" && (
             <SkillsPage key={`skill-${pendingSkillId ?? "none"}`} initialSelectedId={pendingSkillId} />
           )}
-          {activePersona === "claude" && effectiveHasScope("admin:write") && <ClaudeTerminalPage />}
+          {activePersona === "claude" && effectiveHasScope("admin:write") && (
+            <ClaudeTerminalPage project={claudeProject} device={claudeDevice} request={claudeRequest} />
+          )}
+          {activePersona === "overview" && (
+            <OverviewPage
+              agents={agents}
+              claudeSessions={claudeNav.sessions}
+              claudeWorkers={claudeNav.workers}
+              canClaude={claudeNav.available}
+              canCosts={effectiveHasScope("costs:read")}
+              canApprovals={effectiveHasScope("session:read")}
+              costsGroup={groupRestriction}
+              onOpenClaudeSession={(id) => {
+                const x = claudeNav.sessions.find((c) => c.session_id === id);
+                openClaudeSession(id, x?.folder || null, x?.folder ? null : (x?.worker_id ?? null));
+              }}
+              onOpenAgent={(id) => {
+                handleSelectAgent(id);
+                go("builder");
+              }}
+              onOpenAnalytics={() => go("admin")}
+            />
+          )}
 
           {activePersona === "settings" && (
             <SettingsPage
