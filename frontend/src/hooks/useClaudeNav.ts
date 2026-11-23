@@ -18,6 +18,7 @@ export function useClaudeNav(enabled: boolean) {
   const [sessions, setSessions] = useState<ClaudeSession[]>([]);
   const [workers, setWorkers] = useState<ClaudeWorker[]>([]);
   const [available, setAvailable] = useState(false);
+  const [vapidKey, setVapidKey] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     if (!enabled) return;
@@ -25,6 +26,7 @@ export function useClaudeNav(enabled: boolean) {
       const [cfg, list] = await Promise.all([getClaudeConfig(), listClaudeSessions()]);
       setAvailable(cfg.enabled);
       setWorkers(cfg.workers);
+      setVapidKey(cfg.vapid_public_key ?? null);
       setSessions(list.sessions);
     } catch {
       setAvailable(false);
@@ -45,5 +47,5 @@ export function useClaudeNav(enabled: boolean) {
     };
   }, [enabled, refresh]);
 
-  return { sessions, workers, available, refresh };
+  return { sessions, workers, available, vapidKey, refresh };
 }

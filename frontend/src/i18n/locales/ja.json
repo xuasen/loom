@@ -36,7 +36,10 @@
     "noProjects": "プロジェクトはまだありません",
     "newChat": "新しい会話",
     "noChats": "会話はありません",
-    "showAll": "すべて表示（{{count}}）"
+    "showAll": "すべて表示（{{count}}）",
+    "schedules": "スケジュール",
+    "notificationsOn": "通知オン",
+    "notificationsOff": "通知オフ"
   },
   "settings": {
     "title": "設定",

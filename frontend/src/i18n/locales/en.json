@@ -36,7 +36,10 @@
     "noProjects": "No projects yet",
     "newChat": "New conversation",
     "noChats": "No conversations",
-    "showAll": "Show all {{count}}"
+    "showAll": "Show all {{count}}",
+    "schedules": "Schedules",
+    "notificationsOn": "Notifications on",
+    "notificationsOff": "Notifications off"
   },
   "settings": {
     "title": "Settings",

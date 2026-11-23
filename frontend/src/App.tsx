@@ -32,6 +32,8 @@ import { SkillsPage } from "@/pages/SkillsPage";
 import { ClaudeTerminalPage, type ClaudeNavRequest } from "@/pages/ClaudeTerminalPage";
 import { OverviewPage } from "@/pages/OverviewPage";
 import { useClaudeNav } from "@/hooks/useClaudeNav";
+import { ClaudeSchedulesPanel } from "@/components/ClaudeSchedulesPanel";
+import { currentPushSubscription, disablePush, enablePush, pushSupported } from "@/api/claude";
 import type { SessionResponse, InvocationResponse } from "@/api/types";
 import { getRegistryConfig } from "@/api/settings";
 import { listRegistryRecords } from "@/api/registry";
@@ -40,7 +42,7 @@ import { listMcpServers } from "@/api/mcp";
 import { listA2aAgents } from "@/api/a2a";
 import { AuthProvider, useAuth, GROUP_SCOPES, type Scope } from "@/contexts/AuthContext";
 import { LoginPage } from "@/pages/LoginPage";
-import { Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, Menu, LayoutDashboard, ChevronDown, ChevronRight, FolderPlus, Plus, MessageSquare, Monitor, Wrench } from "lucide-react";
+import { Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, Menu, LayoutDashboard, ChevronDown, ChevronRight, FolderPlus, Plus, MessageSquare, Monitor, Wrench, Bell, BellOff, CalendarClock } from "lucide-react";
 import { AdminDashboardPage } from "./pages/AdminDashboardPage";
 import { ChatPage } from "./pages/ChatPage";
 import { OAuthLinkCallbackPage } from "./pages/OAuthLinkCallbackPage";
@@ -440,6 +442,34 @@ function AppContent() {
   }, [isAuthenticated, effectiveHasScope, registryEnabled]);
 
   const claudeNav = useClaudeNav(isAuthenticated && effectiveHasScope("admin:write"));
+  const [showSchedules, setShowSchedules] = useState(false);
+  const [pushOn, setPushOn] = useState(false);
+  const [pushBusy, setPushBusy] = useState(false);
+  useEffect(() => {
+    const key = claudeNav.vapidKey;
+    if (!key || !pushSupported() || Notification.permission !== "granted") return;
+    currentPushSubscription(key).then((x) => setPushOn(!!x)).catch(() => setPushOn(false));
+  }, [claudeNav.vapidKey]);
+  const togglePush = async () => {
+    const key = claudeNav.vapidKey;
+    if (!key) return;
+    setPushBusy(true);
+    try {
+      if (pushOn) {
+        await disablePush();
+        setPushOn(false);
+        toast.success("Notifications off for this device");
+      } else {
+        await enablePush(key);
+        setPushOn(true);
+        toast.success("Notifications on: approvals and finished turns will alert this device");
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setPushBusy(false);
+    }
+  };
 
   type ViewMode = "cards" | "table";
   const [catalogViewMode, setCatalogViewMode] = useState<ViewMode>("cards");
@@ -627,6 +657,12 @@ function AppContent() {
     setClaudeRequest({ nonce: nonce(), newSession: true });
     go("claude");
   };
+  const newProjectChat = (name: string) => {
+    setClaudeProject(name);
+    setClaudeDevice(null);
+    setClaudeRequest({ nonce: nonce(), newSession: true });
+    go("claude");
+  };
   const openDevice = (id: string) => {
     setClaudeDevice(id);
     setClaudeProject(null);
@@ -750,7 +786,22 @@ function AppContent() {
                           {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
                         </span>
                       }
-                      trailing={<span className="absolute right-2 text-[10px] text-muted-foreground/70 tabular-nums group-hover:hidden">{inProject.length}</span>}
+                      trailing={
+                        <>
+                          <span className="pointer-events-none absolute right-8 text-[10px] text-muted-foreground/70 tabular-nums">
+                            {inProject.length}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => newProjectChat(name)}
+                            className="absolute right-1 flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                            aria-label={t("nav.newChat")}
+                            title={t("nav.newChat")}
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                          </button>
+                        </>
+                      }
                     />
                     {open &&
                       inProject.slice(0, MAX_CHATS_PER_DEVICE).map((x) => (
@@ -785,7 +836,21 @@ function AppContent() {
           </SidebarGroup>
 
           {claudeNav.available && (
-            <SidebarGroup id="conversations" label={t("nav.sections.conversations")}>
+            <SidebarGroup
+              id="conversations"
+              label={t("nav.sections.conversations")}
+              action={
+                <button
+                  type="button"
+                  onClick={() => newChat((devices.find((w) => w.online) ?? devices[0])?.worker_id ?? "loom-worker-1")}
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                  aria-label={t("nav.newChat")}
+                  title={t("nav.newChat")}
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                </button>
+              }
+            >
               {devices.map((w) => {
                 const chats = claudeNav.sessions.filter((x) => x.worker_id === w.worker_id && !x.folder);
                 return (
@@ -842,7 +907,7 @@ function AppContent() {
 
         {/* Pinned to the bottom: operations and system settings */}
         <div className="shrink-0 border-t p-2 space-y-0.5">
-          {(effectiveHasScope("security:read") || effectiveHasScope("security:write") || effectiveHasScope("admin:read") || effectiveHasScope("costs:read") || effectiveHasScope("costs:write")) && (
+          {(claudeNav.available || effectiveHasScope("security:read") || effectiveHasScope("security:write") || effectiveHasScope("admin:read") || effectiveHasScope("costs:read") || effectiveHasScope("costs:write")) && (
             <>
               <div className="flex items-center gap-1.5 px-2 pt-0.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground/80">
                 <Wrench className="h-3 w-3" /> {t("nav.sections.ops")}
@@ -853,6 +918,18 @@ function AppContent() {
                 )}
                 {(effectiveHasScope("admin:read") || effectiveHasScope("costs:read") || effectiveHasScope("costs:write")) && (
                   <SidebarItem icon={BarChart3} label={t("nav.analytics")} active={activePersona === "admin"} onClick={() => go("admin")} />
+                )}
+                {claudeNav.available && (
+                  <SidebarItem icon={CalendarClock} label={t("nav.schedules")} active={showSchedules} onClick={() => setShowSchedules(true)} />
+                )}
+                {claudeNav.available && claudeNav.vapidKey && pushSupported() && (
+                  <SidebarItem
+                    icon={pushOn ? Bell : BellOff}
+                    label={pushOn ? t("nav.notificationsOn") : t("nav.notificationsOff")}
+                    active={pushOn}
+                    disabled={pushBusy}
+                    onClick={() => void togglePush()}
+                  />
                 )}
               </div>
             </>
@@ -1157,6 +1234,21 @@ function AppContent() {
         </main>
       </div>
 
+      {showSchedules && (
+        <ClaudeSchedulesPanel
+          onClose={() => {
+            setShowSchedules(false);
+            void claudeNav.refresh();
+          }}
+          currentSessionId={activePersona === "claude" ? (claudeRequest?.sessionId ?? null) : null}
+          cwd={undefined}
+          model={undefined}
+          onOpenSession={(id) => {
+            const x = claudeNav.sessions.find((c) => c.session_id === id);
+            openClaudeSession(id, x?.folder || null, x?.folder ? null : (x?.worker_id ?? null));
+          }}
+        />
+      )}
       <Toaster />
     </div>
   );

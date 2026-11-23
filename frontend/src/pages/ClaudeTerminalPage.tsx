@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle, ArrowDown, Bell, BellOff, Check, ChevronDown, ChevronLeft, ChevronRight, Clock, CornerDownRight,
-  FileText, Folder, FolderInput, FolderPlus, GripHorizontal, Loader2, Maximize2, Minimize2, Paperclip, Plus, RefreshCw, Send, Shield, Sparkles, Square, SquareTerminal, Trash2, X, XCircle,
+  AlertTriangle, ArrowDown, Check, ChevronRight, Clock, CornerDownRight, FileText, Folder, FolderInput, GripHorizontal, Loader2, Maximize2, Minimize2, Paperclip, Send, Shield, Sparkles, Square, Trash2, X, XCircle,
 } from "lucide-react";
-import { ClaudeSchedulesPanel } from "@/components/ClaudeSchedulesPanel";
 import { notifyClaudeChanged } from "@/hooks/useClaudeNav";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -15,18 +13,14 @@ import {
   MODE_LABELS,
   closeClaudeSession,
   createClaudeSession,
-  currentPushSubscription,
   decideClaudeApproval,
   deleteClaudeSession,
-  disablePush,
-  enablePush,
   getClaudeConfig,
   getClaudeEvents,
   getClaudeSession,
   interruptClaudeSession,
   listClaudeSessions,
   modelLabel,
-  pushSupported,
   sendClaudeMessage,
   setClaudeSessionFolder,
   streamClaudeEvents,
@@ -74,15 +68,6 @@ function humanSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function relativeTime(iso?: string | null): string {
-  if (!iso) return "";
-  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return new Date(iso).toLocaleDateString();
 }
 
 function shortPath(p?: string | null): string {
@@ -416,27 +401,17 @@ export function ClaudeTerminalPage({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selected, setSelected] = useState<ClaudeSession | null>(null);
   // Mobile master/detail: show the conversation pane instead of the list.
-  const [showConversation, setShowConversation] = useState(false);
+  // The session list lives in the app sidebar now; kept as a no-op for the old call sites.
+  const setShowConversation = (_open: boolean) => {};
 
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [files, setFiles] = useState<PendingFile[]>([]);
   const [dragOver, setDragOver] = useState(false);
-  const [showSchedules, setShowSchedules] = useState(false);
-  // Folder the next new session goes into; collapsed folders persist per browser.
   const [newFolder, setNewFolder] = useState("");
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => {
-    try {
-      return new Set(JSON.parse(localStorage.getItem("loom_claude_collapsed") || "[]") as string[]);
-    } catch {
-      return new Set();
-    }
-  });
   // Composer height: null = grow with the text (up to ~8 lines); a number = dragged/maximised.
   const [composerHeight, setComposerHeight] = useState<number | null>(null);
   const dragRef = useRef<{ startY: number; startH: number } | null>(null);
-  const [pushOn, setPushOn] = useState(false);
-  const [pushBusy, setPushBusy] = useState(false);
 
   // Settings for a new session, or the live values of the selected one.
   const [mode, setMode] = useState<ClaudeSessionMode>("default");
@@ -456,10 +431,6 @@ export function ClaudeTerminalPage({
   const isClosed = effectiveStatus !== null && CLOSED_STATUSES.has(effectiveStatus);
   const isBusy = effectiveStatus === "RUNNING" || effectiveStatus === "WAITING_APPROVAL";
   const worker = config?.workers.find((w) => w.worker_id === device) ?? config?.workers[0];
-  const scoped = useMemo(
-    () => sessions.filter((x) => (project === null || (x.folder || "") === project) && (device === null || x.worker_id === device)),
-    [sessions, project, device],
-  );
   const models = config?.models ?? [];
   const uploading = files.some((f) => !f.fileId && !f.error);
 
@@ -505,10 +476,11 @@ export function ClaudeTerminalPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request?.nonce]);
 
-  // Switching project/device shows that scope's list (mobile) and clears a stale selection.
+  // Picking a project/device in the sidebar without a session opens a new session there.
   useEffect(() => {
     if (request?.sessionId || request?.newSession) return;
-    setShowConversation(false);
+    setSelectedId(null);
+    setNewFolder(project ?? "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, device]);
 
@@ -528,35 +500,6 @@ export function ClaudeTerminalPage({
     else url.searchParams.delete("session");
     window.history.replaceState(window.history.state, "", url);
   }, [selectedId]);
-
-  useEffect(() => {
-    const key = config?.vapid_public_key;
-    if (!key || !pushSupported() || Notification.permission !== "granted") return;
-    currentPushSubscription(key)
-      .then((s) => setPushOn(!!s))
-      .catch(() => setPushOn(false));
-  }, [config?.vapid_public_key]);
-
-  const togglePush = async () => {
-    const key = config?.vapid_public_key;
-    if (!key) return;
-    setPushBusy(true);
-    try {
-      if (pushOn) {
-        await disablePush();
-        setPushOn(false);
-        toast.success("Notifications off for this device");
-      } else {
-        await enablePush(key);
-        setPushOn(true);
-        toast.success("Notifications on: approvals and finished turns will alert this device");
-      }
-    } catch (e) {
-      toast.error((e as Error).message);
-    } finally {
-      setPushBusy(false);
-    }
-  };
 
   // Load the selected session and adopt its live mode/model in the pickers.
   useEffect(() => {
@@ -717,25 +660,6 @@ export function ClaudeTerminalPage({
     [sessions],
   );
 
-  // Ungrouped first, then folders alphabetically (sub-folders follow their parent).
-  const groups = useMemo(() => {
-    const by = new Map<string, ClaudeSession[]>();
-    for (const x of scoped) {
-      const f = x.folder || "";
-      by.set(f, [...(by.get(f) ?? []), x]);
-    }
-    return [...by.entries()].sort(([a], [b]) => (a === "" ? -1 : b === "" ? 1 : a.localeCompare(b)));
-  }, [scoped]);
-
-  const toggleFolder = (f: string) =>
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(f)) next.delete(f);
-      else next.add(f);
-      localStorage.setItem("loom_claude_collapsed", JSON.stringify([...next]));
-      return next;
-    });
-
   const moveToFolder = async (choice: string) => {
     if (!selectedId) return;
     let folder = choice;
@@ -752,11 +676,6 @@ export function ClaudeTerminalPage({
     } catch (e) {
       toast.error(`Could not move: ${(e as Error).message}`);
     }
-  };
-
-  const newFolderSession = () => {
-    const name = window.prompt("Folder for the new session (use / for sub-folders)");
-    if (name?.trim()) openSession(null, name.trim());
   };
 
   const deleteSession = async () => {
@@ -822,130 +741,8 @@ export function ClaudeTerminalPage({
     );
   }
 
-  const sessionList = (
-    <aside
-      className={`${showConversation ? "hidden" : "flex"} md:flex min-h-0 w-full flex-col border-r bg-card md:w-72 md:rounded-l-xl`}
-    >
-      <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b px-4">
-        <div className="flex items-center gap-2 min-w-0">
-          {project !== null ? <Folder className="h-5 w-5 shrink-0" /> : <SquareTerminal className="h-5 w-5 shrink-0" />}
-          <span className="font-semibold truncate">{project ?? device ?? "Claude device"}</span>
-        </div>
-        <div className="flex items-center gap-1">
-          {config.vapid_public_key && pushSupported() && (
-            <Button
-              size="icon-sm"
-              variant="ghost"
-              onClick={() => void togglePush()}
-              disabled={pushBusy}
-              aria-label={pushOn ? "Turn notifications off" : "Turn notifications on"}
-              title={pushOn ? "Notifications on (tap to turn off)" : "Notify me about approvals and finished turns"}
-            >
-              {pushOn ? <Bell className="h-4 w-4 text-primary" /> : <BellOff className="h-4 w-4" />}
-            </Button>
-          )}
-          <Button size="icon-sm" variant="ghost" onClick={() => setShowSchedules(true)} aria-label="Schedules" title="Schedules">
-            <Clock className="h-4 w-4" />
-          </Button>
-          <Button size="icon-sm" variant="ghost" onClick={() => void refreshSessions()} aria-label="Refresh">
-            <RefreshCw className="h-4 w-4" />
-          </Button>
-          <Button size="icon-sm" variant="ghost" onClick={newFolderSession} aria-label="New folder" title="New session in a new folder">
-            <FolderPlus className="h-4 w-4" />
-          </Button>
-          <Button size="icon-sm" onClick={() => openSession(null)} aria-label="New session">
-            <Plus className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
-      {worker && (
-        <div className="flex items-center gap-2 border-b px-4 py-2 text-xs text-muted-foreground">
-          <span className={`h-2 w-2 rounded-full ${worker.online ? "bg-success" : "bg-muted-foreground/40"}`} />
-          {worker.worker_id} · {worker.online ? "online" : "offline"}
-        </div>
-      )}
-      <div className="flex-1 overflow-y-auto overscroll-contain p-2">
-        {scoped.length === 0 && (
-          <div className="px-3 py-10 text-center text-sm text-muted-foreground">
-            No sessions yet.
-            <div className="mt-3">
-              <Button size="sm" onClick={() => openSession(null)}>
-                <Plus className="h-4 w-4" /> New session
-              </Button>
-            </div>
-          </div>
-        )}
-        {groups.map(([folder, list]) => {
-          const isCollapsed = collapsed.has(folder);
-          const depth = folder ? folder.split("/").length - 1 : 0;
-          return (
-            <div key={folder || "__none__"} className="mb-1">
-              {folder && (
-                <div className="group flex items-center" style={{ paddingLeft: depth * 12 }}>
-                  <button
-                    type="button"
-                    onClick={() => toggleFolder(folder)}
-                    className="flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-accent/50"
-                  >
-                    {isCollapsed ? <ChevronRight className="h-3.5 w-3.5 shrink-0" /> : <ChevronDown className="h-3.5 w-3.5 shrink-0" />}
-                    <Folder className="h-3.5 w-3.5 shrink-0" />
-                    <span className="truncate">{folder.split("/").pop()}</span>
-                    <span className="ml-auto shrink-0 opacity-60">{list.length}</span>
-                  </button>
-                  <Button
-                    size="icon-sm"
-                    variant="ghost"
-                    className="h-7 w-7 opacity-100 md:opacity-0 md:group-hover:opacity-100"
-                    onClick={() => openSession(null, folder)}
-                    aria-label={`New session in ${folder}`}
-                    title={`New session in ${folder}`}
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
-              )}
-              {!isCollapsed && (
-                <div style={{ paddingLeft: folder ? depth * 12 + 10 : 0 }}>
-                  {list.map((s) => (
-              <button
-                key={s.session_id}
-                type="button"
-                onClick={() => openSession(s.session_id)}
-                className={`w-full rounded-lg px-3 py-3 text-left transition-colors md:py-2.5 ${
-                  s.session_id === selectedId ? "bg-accent" : "hover:bg-accent/50 active:bg-accent"
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <span className={`h-2 w-2 shrink-0 rounded-full ${STATUS_DOT[s.status]}`} />
-                  <span className="min-w-0 flex-1 truncate text-sm font-medium">{s.title || "Untitled"}</span>
-                  <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground md:hidden" />
-                </div>
-                <div className="mt-0.5 pl-4 text-xs text-muted-foreground truncate">
-                  {STATUS_LABEL[s.status]} · {relativeTime(s.updated_at ?? s.created_at)} · {s.turns} turns
-                  {s.cwd ? ` · ${shortPath(s.cwd)}` : ""}
-                </div>
-              </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </aside>
-  );
-
   const header = (
     <div className="flex h-14 shrink-0 items-center gap-2 border-b px-2 md:px-4">
-      <Button
-        size="icon-sm"
-        variant="ghost"
-        className="md:hidden"
-        onClick={() => setShowConversation(false)}
-        aria-label="Back to sessions"
-      >
-        <ChevronLeft className="h-5 w-5" />
-      </Button>
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-semibold">
           {selectedId ? selected?.title || "Session" : "New session"}
@@ -1313,27 +1110,11 @@ export function ClaudeTerminalPage({
 
   return (
     <div className="flex h-[calc(100dvh-3.5rem)] min-h-0 overflow-hidden bg-background md:h-[calc(100dvh-2rem)] md:rounded-xl md:border">
-      {sessionList}
-      <section className={`${showConversation ? "flex" : "hidden"} md:flex min-h-0 min-w-0 flex-1 flex-col`}>
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col">
         {header}
         {transcript}
         {composer}
       </section>
-      {showSchedules && (
-        <ClaudeSchedulesPanel
-          onClose={() => {
-            setShowSchedules(false);
-            void refreshSessions();
-          }}
-          currentSessionId={selectedId && !isClosed ? selectedId : null}
-          cwd={cwd || selected?.cwd || undefined}
-          model={model || undefined}
-          onOpenSession={(id) => {
-            void refreshSessions();
-            openSession(id);
-          }}
-        />
-      )}
     </div>
   );
 }
