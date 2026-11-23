@@ -40,7 +40,7 @@ import { listMcpServers } from "@/api/mcp";
 import { listA2aAgents } from "@/api/a2a";
 import { AuthProvider, useAuth, GROUP_SCOPES, type Scope } from "@/contexts/AuthContext";
 import { LoginPage } from "@/pages/LoginPage";
-import { BookOpen, Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, Menu, LayoutDashboard, ChevronDown, ChevronRight, FolderPlus, Plus, MessageSquare, Monitor, Wrench } from "lucide-react";
+import { Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, Menu, LayoutDashboard, ChevronDown, ChevronRight, FolderPlus, Plus, MessageSquare, Monitor, Wrench } from "lucide-react";
 import { AdminDashboardPage } from "./pages/AdminDashboardPage";
 import { ChatPage } from "./pages/ChatPage";
 import { OAuthLinkCallbackPage } from "./pages/OAuthLinkCallbackPage";
@@ -770,9 +770,6 @@ function AppContent() {
           )}
 
           <SidebarGroup id="components" label={t("nav.sections.components")}>
-            {effectiveHasScope("catalog:read") && (
-              <SidebarItem icon={BookOpen} label={t("nav.catalog")} active={activePersona === "catalog"} onClick={() => go("catalog")} />
-            )}
             {(effectiveHasScope("agent:read") || effectiveHasScope("agent:write")) && (
               <SidebarItem icon={Bot} label={t("nav.agents")} active={activePersona === "builder"} onClick={() => go("builder")} count={agents.length} />
             )}
