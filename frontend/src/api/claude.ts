@@ -376,6 +376,10 @@ export async function downloadClaudeOutput(sessionId: string, fileId: string, na
   setTimeout(() => URL.revokeObjectURL(href), 30000);
 }
 
+export function renameClaudeProject(oldName: string, newName: string): Promise<{ renamed: number; folder?: string }> {
+  return apiFetch("/api/claude/folders/rename", { method: "POST", body: JSON.stringify({ old: oldName, new: newName }) });
+}
+
 export function deleteClaudeSession(id: string): Promise<void> {
   return apiFetch<void>(path(id, "/delete"), { method: "POST" });
 }

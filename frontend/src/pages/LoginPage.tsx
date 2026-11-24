@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { BrandLogo } from "@/components/BrandLogo";
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -105,16 +106,7 @@ export function LoginPage() {
     <div className="min-h-screen bg-background flex items-center justify-center pb-[25vh]">
       <div className="w-full max-w-sm space-y-6">
         <div className="text-center">
-          <img
-            src="/assets/loom_dark_alt.png"
-            alt="Loom"
-            className="h-16 mx-auto dark:block hidden"
-          />
-          <img
-            src="/assets/loom_light_alt.png"
-            alt="Loom"
-            className="h-16 mx-auto dark:hidden block"
-          />
+          <BrandLogo size="lg" />
         </div>
 
         <div className="rounded-lg border bg-card p-6 shadow-sm space-y-4">

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, Children } from "react";
+import { BrandLogo } from "@/components/BrandLogo";
 import { useTranslation } from "react-i18next";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
@@ -14,7 +15,7 @@ import {
   TimezoneProvider,
   useTimezone,
 } from "@/contexts/TimezoneContext";
-import { ThemeProvider, useTheme, isLightTheme } from "@/contexts/ThemeContext";
+import { ThemeProvider, useTheme } from "@/contexts/ThemeContext";
 import { useAgents } from "@/hooks/useAgents";
 import { useSessions } from "@/hooks/useSessions";
 import { clearInvokeState } from "@/hooks/useInvoke";
@@ -33,7 +34,7 @@ import { ClaudeTerminalPage, type ClaudeNavRequest } from "@/pages/ClaudeTermina
 import { OverviewPage } from "@/pages/OverviewPage";
 import { useClaudeNav } from "@/hooks/useClaudeNav";
 import { ClaudeSchedulesPanel } from "@/components/ClaudeSchedulesPanel";
-import { currentPushSubscription, disablePush, enablePush, pushSupported } from "@/api/claude";
+import { currentPushSubscription, disablePush, enablePush, pushSupported, renameClaudeProject } from "@/api/claude";
 import type { SessionResponse, InvocationResponse } from "@/api/types";
 import { getRegistryConfig } from "@/api/settings";
 import { listRegistryRecords } from "@/api/registry";
@@ -42,7 +43,7 @@ import { listMcpServers } from "@/api/mcp";
 import { listA2aAgents } from "@/api/a2a";
 import { AuthProvider, useAuth, GROUP_SCOPES, type Scope } from "@/contexts/AuthContext";
 import { LoginPage } from "@/pages/LoginPage";
-import { Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, Menu, LayoutDashboard, ChevronDown, ChevronRight, FolderPlus, Plus, MessageSquare, Monitor, Wrench, Bell, BellOff, CalendarClock } from "lucide-react";
+import { Shield, Bot, Brain, Network, LogOut, User, Settings, Eye, BarChart3, Sun, Moon, Puzzle, Menu, LayoutDashboard, ChevronDown, ChevronRight, FolderPlus, Plus, MessageSquare, Monitor, Wrench, Pencil, Bell, BellOff, CalendarClock } from "lucide-react";
 import { AdminDashboardPage } from "./pages/AdminDashboardPage";
 import { ChatPage } from "./pages/ChatPage";
 import { OAuthLinkCallbackPage } from "./pages/OAuthLinkCallbackPage";
@@ -663,6 +664,26 @@ function AppContent() {
     setClaudeRequest({ nonce: nonce(), newSession: true });
     go("claude");
   };
+  const renameProject = async (name: string) => {
+    const next = window.prompt(t("nav.renameProjectPrompt"), name)?.trim();
+    if (!next || next === name) return;
+    try {
+      const r = await renameClaudeProject(name, next);
+      const folder = r.folder ?? next;
+      if (claudeProject === name) setClaudeProject(folder);
+      setExpandedProjects((prev) => {
+        if (!prev.has(name)) return prev;
+        const s = new Set(prev);
+        s.delete(name);
+        s.add(folder);
+        return s;
+      });
+      await claudeNav.refresh();
+      toast.success(t("nav.projectRenamed", { name: folder }));
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  };
   const openDevice = (id: string) => {
     setClaudeDevice(id);
     setClaudeProject(null);
@@ -720,12 +741,8 @@ function AppContent() {
           ${navOpen ? "translate-x-0 shadow-xl" : "-translate-x-full"}
           md:static md:z-auto md:w-64 md:translate-x-0 md:shadow-none md:pt-0 md:pb-0`}
       >
-        <div className="px-4 py-3 border-b shrink-0">
-          <img
-            src={isLightTheme(theme) ? "/assets/loom_light_alt.png" : "/assets/loom_dark_alt.png"}
-            alt="Loom"
-            className="h-12"
-          />
+        <div className="flex h-16 shrink-0 items-center border-b px-4">
+          <BrandLogo />
         </div>
         {/* Scrolling part: overview, projects, components, conversations */}
         <nav className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-2 space-y-3">
@@ -788,9 +805,18 @@ function AppContent() {
                       }
                       trailing={
                         <>
-                          <span className="pointer-events-none absolute right-8 text-[10px] text-muted-foreground/70 tabular-nums">
+                          <span className="pointer-events-none absolute right-14 text-[10px] text-muted-foreground/70 tabular-nums">
                             {inProject.length}
                           </span>
+                          <button
+                            type="button"
+                            onClick={() => void renameProject(name)}
+                            className="absolute right-7 flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                            aria-label={t("nav.renameProject")}
+                            title={t("nav.renameProject")}
+                          >
+                            <Pencil className="h-3 w-3" />
+                          </button>
                           <button
                             type="button"
                             onClick={() => newProjectChat(name)}
@@ -1022,11 +1048,7 @@ function AppContent() {
           >
             <Menu className="h-5 w-5" />
           </button>
-          <img
-            src={isLightTheme(theme) ? "/assets/loom_light_alt.png" : "/assets/loom_dark_alt.png"}
-            alt="Loom"
-            className="h-7"
-          />
+          <BrandLogo size="sm" />
         </div>
         {activePersona === "builder" && selectedAgentId !== null && (
           <header className="border-b">

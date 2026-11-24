@@ -1,4 +1,4 @@
-/* Loom service worker: shows Claude Terminal notifications (Web Push) and
+/* Baton service worker: shows Claude Terminal notifications (Web Push) and
  * opens the session when one is tapped. No caching: the app is always loaded
  * from the network. */
 self.addEventListener("install", () => self.skipWaiting());
@@ -9,7 +9,7 @@ self.addEventListener("push", (event) => {
   try {
     data = event.data ? event.data.json() : {};
   } catch {
-    data = { title: "Loom", body: event.data ? event.data.text() : "" };
+    data = { title: "Baton", body: event.data ? event.data.text() : "" };
   }
   const url = typeof data.url === "string" && data.url.startsWith("/") ? data.url : "/";
   event.waitUntil(
@@ -20,12 +20,12 @@ self.addEventListener("push", (event) => {
         (c) => c.focused && c.visibilityState === "visible" && data.session_id && c.url.includes(data.session_id),
       );
       if (watching) return;
-      await self.registration.showNotification(data.title || "Loom", {
+      await self.registration.showNotification(data.title || "Baton", {
         body: data.body || "",
         tag: data.tag || undefined,
         renotify: true,
-        icon: "/assets/loom_favicon.png",
-        badge: "/assets/loom_favicon.png",
+        icon: "/assets/baton_256.png",
+        badge: "/assets/baton_256.png",
         data: { url },
       });
     })(),

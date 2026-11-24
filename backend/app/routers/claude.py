@@ -1067,3 +1067,43 @@ def download_output(
         "Cache-Control": "private, no-store",
         "X-Content-Type-Options": "nosniff",
     })
+
+
+class RenameFolderRequest(BaseModel):
+    old: str = Field(min_length=1, max_length=120, pattern=r"^[^\x00-\x1f]*$")
+    new: str = Field(min_length=1, max_length=120, pattern=r"^[^\x00-\x1f]*$")
+
+
+@router.post("/folders/rename")
+def rename_folder(req: RenameFolderRequest, user: UserInfo = Depends(require_scopes(REQUIRED_SCOPE))) -> dict:
+    """Rename a project (folder) for the caller's sessions, sub-projects included.
+
+    Renaming onto an existing project merges the two.
+    """
+    _require_enabled()
+    norm = lambda f: "/".join(p.strip() for p in f.split("/") if p.strip())  # noqa: E731
+    old, new = norm(req.old), norm(req.new)
+    if not old or not new:
+        raise HTTPException(status_code=400, detail="Project name cannot be empty")
+    if new == old:
+        return {"renamed": 0}
+    if new.startswith(old + "/"):
+        raise HTTPException(status_code=400, detail="Cannot move a project inside itself")
+    items = _sessions().query(
+        IndexName="by_created",
+        KeyConditionExpression=Key("kind").eq(KIND),
+        FilterExpression=Attr("submitted_by").eq(user.username) & Attr("deleted").ne(True)
+        & (Attr("folder").eq(old) | Attr("folder").begins_with(old + "/")),
+        Limit=1000,
+    ).get("Items", [])
+    for it in items:
+        folder = it.get("folder") or ""
+        _sessions().update_item(
+            Key={"task_id": it["task_id"]},
+            UpdateExpression="SET #f = :f",
+            ConditionExpression="#by = :u",
+            ExpressionAttributeNames={"#f": "folder", "#by": "submitted_by"},
+            ExpressionAttributeValues={":f": new + folder[len(old):], ":u": user.username},
+        )
+    logger.info("Claude project %r renamed to %r by %s (%d sessions)", old, new, user.username, len(items))
+    return {"renamed": len(items), "folder": new}

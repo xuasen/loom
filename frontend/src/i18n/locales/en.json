@@ -39,7 +39,10 @@
     "showAll": "Show all {{count}}",
     "schedules": "Schedules",
     "notificationsOn": "Notifications on",
-    "notificationsOff": "Notifications off"
+    "notificationsOff": "Notifications off",
+    "renameProject": "Rename project",
+    "renameProjectPrompt": "New project name",
+    "projectRenamed": "Project renamed to {{name}}"
   },
   "settings": {
     "title": "Settings",

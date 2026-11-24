@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { BrandLogo } from "@/components/BrandLogo";
 import { navigateToExternal } from "@/lib/navigation";
 import { Send, Plus, Brain, LogOut, Bot, User, X, Loader2, Sun, Moon, RefreshCw, ChevronDown, Wrench, Plug, KeyRound, Unplug, Link2, UserCheck, AlertTriangle, Shield } from "lucide-react";
 import { ApprovalRequestBubble } from "@/components/ApprovalDialog";
@@ -15,7 +16,7 @@ import { listMemories, getMemoryRecords } from "@/api/memories";
 import { trackAction } from "@/api/audit";
 import { useInvoke, clearInvokeState, sendElicitationResponse, type StreamSegment } from "@/hooks/useInvoke";
 import { useAuth } from "@/contexts/AuthContext";
-import { useTheme, isLightTheme } from "@/contexts/ThemeContext";
+import { useTheme } from "@/contexts/ThemeContext";
 import { listConnectors, setUserApiKey, deleteUserApiKey } from "@/api/mcp";
 import { listAuthorizerConfigs, checkAuthorizerLinkStatus, getAuthorizerLinkAuthorizeUrl, submitAuthorizerLinkCallback, deleteAuthorizerLink } from "@/api/security";
 import { Input } from "@/components/ui/input";
@@ -782,15 +783,7 @@ export function ChatPage({ userGroups, onLogout, viewAsUser, onExitViewAs }: Cha
         <aside className="w-64 border-r bg-card flex flex-col shrink-0 h-full overflow-hidden">
           {/* Logo */}
           <div className="p-4 border-b shrink-0">
-            <img
-              src={
-                isLightTheme(theme)
-                  ? "/assets/loom_light_alt.png"
-                  : "/assets/loom_dark_alt.png"
-              }
-              alt="Loom"
-              className="h-15"
-            />
+            <BrandLogo />
           </div>
 
           {/* Agent display (single agent) */}

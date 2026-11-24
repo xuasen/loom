@@ -39,7 +39,10 @@
     "showAll": "すべて表示（{{count}}）",
     "schedules": "スケジュール",
     "notificationsOn": "通知オン",
-    "notificationsOff": "通知オフ"
+    "notificationsOff": "通知オフ",
+    "renameProject": "プロジェクト名を変更",
+    "renameProjectPrompt": "新しいプロジェクト名",
+    "projectRenamed": "{{name}} に名前を変更しました"
   },
   "settings": {
     "title": "設定",

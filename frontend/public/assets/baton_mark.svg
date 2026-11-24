@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="6" y1="4" x2="58" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#8B3DFF"/>
+    </linearGradient>
+    <linearGradient id="arc" x1="12" y1="46" x2="52" y2="18" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.75"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#bg)"/>
+  <!-- the conductor's sweep -->
+  <path d="M13 44 C 18 26, 34 15, 52 15" stroke="url(#arc)" stroke-width="3.2" stroke-linecap="round"/>
+  <!-- the baton: grip at the lower left, fine tip at the upper right -->
+  <path d="M20.5 43.5 L46 18" stroke="#FFFFFF" stroke-width="3.4" stroke-linecap="round"/>
+  <circle cx="18.5" cy="45.5" r="5.2" fill="#FFFFFF"/>
+  <!-- the agents it directs -->
+  <circle cx="44" cy="43" r="2.6" fill="#FFFFFF" fill-opacity="0.95"/>
+  <circle cx="51" cy="35" r="2.1" fill="#FFFFFF" fill-opacity="0.7"/>
+  <circle cx="36.5" cy="49.5" r="2.1" fill="#FFFFFF" fill-opacity="0.7"/>
+</svg>
