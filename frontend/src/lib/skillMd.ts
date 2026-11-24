@@ -1,6 +1,6 @@
 /** Parsing/building helpers for SKILL.md content.
  *
- * The frontmatter schema Loom writes (and AWS's registry validates) is small
+ * The frontmatter schema Baton writes (and AWS's registry validates) is small
  * and fixed — {name, description, license, metadata: {author, version}} —
  * so this is a purpose-built parser for that shape, not a general YAML
  * parser. Keeping the fields and the frontmatter in sync (rather than

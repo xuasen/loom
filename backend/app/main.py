@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 # Create FastAPI application
 app = FastAPI(
-    title="Loom Backend API",
+    title="Baton Backend API",
     description="Backend API for the Loom agent platform",
     version="1.10.3",
     lifespan=lifespan,

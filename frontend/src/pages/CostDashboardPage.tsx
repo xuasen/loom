@@ -381,7 +381,7 @@ export function CostDashboardPage({ groupRestriction, days }: CostDashboardPageP
               <Card className="gap-0 overflow-hidden py-0">
                 <div className="flex items-center gap-2.5 border-b px-4 py-3">
                   <span className="text-[13.5px] font-semibold">Memory actuals</span>
-                  <span className="text-[11.5px] text-muted-foreground">From APPLICATION_LOGS, filtered to Loom-tracked sessions.</span>
+                  <span className="text-[11.5px] text-muted-foreground">From APPLICATION_LOGS, filtered to Baton-tracked sessions.</span>
                 </div>
                 <Table>
                   <TableHeader>

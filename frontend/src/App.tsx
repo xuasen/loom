@@ -783,6 +783,7 @@ function AppContent() {
                       label={name}
                       active={activePersona === "claude" && claudeProject === name && !claudeRequest?.sessionId}
                       onClick={() => openProject(name)}
+                      reserve={76}
                       leading={
                         <span
                           role="button"
@@ -887,6 +888,7 @@ function AppContent() {
                       leading={<Monitor className="h-3.5 w-3.5 shrink-0" />}
                       active={activePersona === "claude" && claudeDevice === w.worker_id && claudeProject === null && !claudeRequest?.sessionId}
                       onClick={() => openDevice(w.worker_id)}
+                      reserve={32}
                       trailing={
                         <button
                           type="button"

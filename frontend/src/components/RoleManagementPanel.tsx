@@ -26,7 +26,7 @@ function toArray(value: string | string[]): string[] {
   return Array.isArray(value) ? value : [value];
 }
 
-/** Best-effort human label for a raw IAM statement, since Loom's generated policies carry no Sid. */
+/** Best-effort human label for a raw IAM statement, since Baton's generated policies carry no Sid. */
 function describeStatement(stmt: PolicyStatement): { label: string; service: string } {
   const actions = toArray(stmt.Action);
   const service = actions[0]?.split(":")[0] ?? "unknown";

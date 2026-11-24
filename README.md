@@ -1,4 +1,8 @@
-# Loom for AWS
+# Baton
+
+> Baton is a private fork of [awslabs/loom](https://github.com/awslabs/loom): Loom's AgentCore management plane, deployed behind CloudFront + WAF with an internal ALB, plus Claude device sessions (outbound-only workers over IoT + DynamoDB), projects, an overview page, schedules, Web Push and file delivery via S3.
+
+## Upstream: Loom for AWS
 
 [![GitHub stars](https://img.shields.io/github/stars/awslabs/loom?style=flat&logo=github)](https://github.com/awslabs/loom/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/awslabs/loom?style=flat&logo=github)](https://github.com/awslabs/loom/network)

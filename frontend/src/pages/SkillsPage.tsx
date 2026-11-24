@@ -95,7 +95,7 @@ function ExternalLinkRow({ url }: { url: string }) {
   // url comes from the skill record's agentSkillsDefinition descriptor
   // (repository.url / websiteUrl), which is authored through the registry.
   // An unchecked href here is a one-click XSS: a javascript: target would run
-  // in Loom's origin, where the session tokens live. Show the value either
+  // in Baton's origin, where the session tokens live. Show the value either
   // way so nothing is silently hidden, but only make it clickable if it is a
   // real https URL.
   if (!isSafeExternalUrl(url)) {

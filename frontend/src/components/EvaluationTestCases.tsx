@@ -33,7 +33,7 @@ import type { EvaluatorInfo, EvaluationMode, EvaluationTestCase, EvaluationTestC
 /** Author and run evaluations (on-demand or batch) for one agent, and review the latest
  * result per test case.
  *
- * Loom saves only the test case itself (prompt, optional expected response,
+ * Baton saves only the test case itself (prompt, optional expected response,
  * which evaluators to apply, pass threshold, optional model override) —
  * running one invokes the agent for real and hands that session to
  * AgentCore's StartBatchEvaluation, which does the actual judging. Each

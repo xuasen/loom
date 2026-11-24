@@ -72,7 +72,7 @@
       "sourceEnvironment": "from environment",
       "sourceNone": "not set",
       "environmentNote": "This default comes from the LOOM_GUARDRAIL_* environment variables on the backend. Saving here overrides it.",
-      "policiesNote": "Block, mask, and detect behavior is configured on the guardrail itself in Amazon Bedrock. Loom only chooses which guardrail and version an agent uses, and how it is applied. Changes reach agents at their next deploy or redeploy.",
+      "policiesNote": "Block, mask, and detect behavior is configured on the guardrail itself in Amazon Bedrock. Baton only chooses which guardrail and version an agent uses, and how it is applied. Changes reach agents at their next deploy or redeploy.",
       "readOnlyNote": "Only administrators can change the default guardrail.",
       "enabled": "Enabled",
       "enabledHelper": "Agents set to inherit the default get this guardrail",

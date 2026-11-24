@@ -570,7 +570,7 @@ export interface PolicyStatement {
 }
 
 /**
- * Registers an IAM role that already exists. There is no create mode — Loom
+ * Registers an IAM role that already exists. There is no create mode — Baton
  * does not provision IAM roles, so the ARN is required.
  */
 export interface ManagedRoleCreateRequest {
@@ -580,7 +580,7 @@ export interface ManagedRoleCreateRequest {
   tags?: Record<string, string>;
 }
 
-/** Only the description is editable; Loom cannot apply a policy change. */
+/** Only the description is editable; Baton cannot apply a policy change. */
 export interface ManagedRoleUpdateRequest {
   description?: string;
 }

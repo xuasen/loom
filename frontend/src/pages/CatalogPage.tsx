@@ -397,7 +397,7 @@ export function CatalogPage({
         toast.success("Memory deletion initiated");
       } else {
         setMemories((prev) => prev.filter((m) => m.id !== id));
-        toast.success(deleteInAws ? "Memory resource deleted" : "Memory removed from Loom");
+        toast.success(deleteInAws ? "Memory resource deleted" : "Memory removed from Baton");
       }
     } catch (e) {
       toast.error(e instanceof ApiError ? e.detail : "Failed to delete memory");

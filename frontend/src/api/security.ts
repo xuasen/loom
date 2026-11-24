@@ -114,7 +114,7 @@ export type AuthorizerLinkAuthorize = {
  * The returned `authorize_url` is assigned to `window.location.href` by every
  * caller, and it is built from an OIDC discovery document served by whatever
  * host an authorizer's `discovery_url` points at. A `javascript:` URL there
- * would execute in Loom's own origin, where the session tokens live in
+ * would execute in Baton's own origin, where the session tokens live in
  * sessionStorage.
  *
  * The backend validates the scheme at discovery-persist time and again before

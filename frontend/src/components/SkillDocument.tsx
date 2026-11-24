@@ -23,7 +23,7 @@ interface SkillDocumentProps {
 }
 
 /** Renders a skill's markdown body as a tight, document-style layout —
- * matching the Claude Design "Loom Skills" mockup's spacing/type scale
+ * matching the Claude Design "Baton Skills" mockup's spacing/type scale
  * rather than a generic prose article:
  * - a paragraph starting with "IMPORTANT" renders as a warning callout
  * - a "## Prerequisites" section's bullets render as chips instead of a list

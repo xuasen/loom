@@ -4,8 +4,8 @@
  * Several redirect targets originate in an OIDC discovery document — the
  * login `authorization_endpoint`, the Link Account `authorize_url`, the
  * logout `issuer_url`. A discovery document is served by whatever host an
- * administrator pointed Loom at, so its contents are attacker-influenced. A
- * `javascript:` URL assigned to `window.location.href` executes in Loom's own
+ * administrator pointed Baton at, so its contents are attacker-influenced. A
+ * `javascript:` URL assigned to `window.location.href` executes in Baton's own
  * origin, where the session tokens live in sessionStorage.
  *
  * The backend rejects non-https endpoints at discovery time and again before
@@ -45,7 +45,7 @@ export function navigateToExternal(url: string | null | undefined, what: string)
  * Use this for links whose target came from the server — a registry record's
  * repository/website URL, for instance — where the right behaviour is to
  * render the value as plain text rather than throw. Clicking a `javascript:`
- * href runs in Loom's origin, where the session tokens live, so an unchecked
+ * href runs in Baton's origin, where the session tokens live, so an unchecked
  * server-supplied href is a one-click XSS.
  *
  * react-markdown's `defaultUrlTransform` already does this for links inside

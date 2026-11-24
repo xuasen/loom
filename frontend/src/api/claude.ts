@@ -11,7 +11,7 @@ import { apiFetch, getAuthToken, getBaseUrl, tryRefreshToken } from "./client";
  */
 
 export type ClaudeSessionStatus = "IDLE" | "RUNNING" | "WAITING_APPROVAL" | "CLOSED" | "FAILED";
-/** Claude Code permission modes (Shift+Tab in the CLI) + Loom's "unattended". */
+/** Claude Code permission modes (Shift+Tab in the CLI) + Baton's "unattended". */
 export type ClaudeSessionMode = "default" | "acceptEdits" | "plan" | "auto" | "unattended";
 
 export const MODE_LABELS: Record<ClaudeSessionMode, string> = {

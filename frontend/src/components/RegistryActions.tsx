@@ -91,7 +91,7 @@ export function RegistryActions({ resourceType, resourceId, registryRecordId, re
 
   if (!registryRecordId && !registryStatus) {
     // A skill *is* a registry record from the moment it's created (there's
-    // no separate Loom resource to "register" it from, unlike mcp/a2a/agent)
+    // no separate Baton resource to "register" it from, unlike mcp/a2a/agent)
     // — this branch should never be reached for one.
     if (resourceType === "skill") return null;
     return (

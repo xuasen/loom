@@ -287,7 +287,7 @@ export function OverviewPage({
               </div>
             )}
             <p className="pt-1 text-[11px] text-muted-foreground">
-              Agent 费用是 Loom 按调用量估算的；Claude 会话费用是 Claude Code 报告的 token 费用。都不含 ECS、RDS、NAT 等基础设施。
+              Agent 费用是 Baton 按调用量估算的；Claude 会话费用是 Claude Code 报告的 token 费用。都不含 ECS、RDS、NAT 等基础设施。
             </p>
           </div>
         </Card>
