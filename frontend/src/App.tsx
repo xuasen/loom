@@ -185,6 +185,7 @@ function SidebarRow({
   indent = 0,
   leading,
   trailing,
+  reserve = 0,
 }: {
   label: string;
   active: boolean;
@@ -193,12 +194,15 @@ function SidebarRow({
   indent?: number;
   leading?: React.ReactNode;
   trailing?: React.ReactNode;
+  /** Space (px) kept free on the right for the trailing controls. */
+  reserve?: number;
 }) {
   return (
     <div className="group relative flex items-center" style={{ paddingLeft: indent }}>
       <button
         type="button"
         onClick={onClick}
+        style={reserve ? { paddingRight: reserve } : undefined}
         className={`flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-3 text-left text-[13px] transition-colors ${
           active ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent/50 hover:text-foreground"
         }`}
